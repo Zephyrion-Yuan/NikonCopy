@@ -1,0 +1,25 @@
+# Build outputs
+build/
+app/build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradle wrapper JAR (regenerable via `gradle wrapper`)
+# gradle/wrapper/gradle-wrapper.jar
+
+# Local config (contains sdk.dir)
+local.properties
+
+# Debug / investigation artifacts (kept in nikon_debug/)
+nikon_debug/
+
+# Claude Code
+.claude/
