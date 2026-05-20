@@ -157,7 +157,11 @@ class PtpClient(
          * isn't in the public OsConstants and the method is package-private on some
          * Android versions.
          */
+        @android.annotation.SuppressLint("BlockedPrivateApi", "DiscouragedPrivateApi")
         fun tryIoctlResetWithoutSession(conn: UsbDeviceConnection): Boolean {
+            // Known blocked on API 35+ (Android 16) — the reflective call will
+            // throw and we'll return false. We keep the path for older devices
+            // where the bypass still works. Lint baseline is intentional.
             return try {
                 val osClass = Class.forName("android.system.Os")
                 val method = osClass.getDeclaredMethod(
