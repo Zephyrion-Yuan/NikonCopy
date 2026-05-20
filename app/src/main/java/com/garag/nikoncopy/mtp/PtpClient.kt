@@ -40,7 +40,7 @@ private const val FMT_MP4 = 0xB982 // Nikon-ish; format codes vary by camera
 private const val FMT_UNDEFINED = 0x3000
 
 // Bulk transfer constants.
-private const val MAX_BULK_BYTES = 16384       // Android caps a single bulkTransfer at 16 KiB
+private const val MAX_BULK_BYTES = 262144       // 256 KiB — reduces JNI call overhead on USB 3.0
 private const val COMMAND_TIMEOUT_MS = 5_000
 private const val OBJECT_TIMEOUT_MS = 30_000
 private const val RECOVERY_DRAIN_TIMEOUT_MS = 100
@@ -48,7 +48,12 @@ private const val RECOVERY_DRAIN_MAX_READS = 8
 private const val RECOVERY_SETTLE_MS = 250L
 private const val STALE_SKIP_MAX = 4
 
-private val EXTENSIONS = setOf("nef", "jpg", "jpeg", "mp4")
+val DEFAULT_MEDIA_EXTENSIONS = setOf(
+    "jpg", "jpeg",
+    "nef", "arw", "cr2", "cr3", "raf", "rw2", "dng",
+    "heif", "heic", "hif",
+    "mp4", "mov",
+)
 
 data class MtpFile(
     val handle: Int,
@@ -56,7 +61,13 @@ data class MtpFile(
     val size: Long,
     val dateModifiedMillis: Long,   // 0 if camera didn't supply it
     val format: Int,
-)
+    val storageId: Int,
+    val parentHandle: Int,
+    val directoryPath: String = "/",
+) {
+    val extension: String
+        get() = name.substringAfterLast('.', "").lowercase()
+}
 
 /**
  * Bare-metal PTP client that talks directly to a Nikon (or any class-6/1/1 PTP
@@ -83,6 +94,7 @@ data class MtpFile(
 class PtpClient(
     private val connection: UsbDeviceConnection,
     private val intf: UsbInterface,
+    cleanConnection: Boolean = false,
 ) : AutoCloseable {
 
     private val sessionId = 1
@@ -104,24 +116,30 @@ class PtpClient(
         bulkOut = outEp ?: throw IOException("PTP: no bulk OUT endpoint on interface ${intf.id}")
         Log.i(TAG, "PTP endpoints: in=ep${bulkIn.address} maxPkt=${bulkIn.maxPacketSize} out=ep${bulkOut.address} maxPkt=${bulkOut.maxPacketSize}")
 
-        // Force-claim — kicks com.android.mtp out so we can drive PTP ourselves.
         if (!connection.claimInterface(intf, /* force = */ true)) {
             throw IOException("PTP: force claimInterface failed")
         }
 
-        // CRITICAL: com.android.mtp may have left the bulk endpoints in a stalled
-        // state OR with stale data (their leftover transaction's response) sitting
-        // in the IN pipe. Without this cleanup, our first read commonly returns -1
-        // (immediate stall, not timeout). Clearing halt + draining residue puts the
-        // pipes in a known-clean state before we begin our session.
-        clearHalt(bulkOut)
-        clearHalt(bulkIn)
-        drainBulkIn()
+        if (cleanConnection) {
+            // com.android.mtp is disabled — no stale state to clean up.
+            // Skipping clearHalt avoids desynchronising the DATA0/DATA1 toggle
+            // on an already-clean USB pipe.
+            Log.i(TAG, "clean connection: skipping clearHalt/drain")
+        } else {
+            // com.android.mtp may have left the bulk endpoints stalled or with
+            // residual data. Clear halt + drain puts pipes in a known state.
+            clearHalt(bulkOut)
+            clearHalt(bulkIn)
+            drainBulkIn()
+        }
 
         try {
             openSession(sessionId)
             sessionOpen = true
-            Log.i(TAG, "PTP session opened")
+            // Give the camera time to initialise its storage subsystem after
+            // the session is established — Nikon Z f needs a brief settle.
+            Thread.sleep(300)
+            Log.i(TAG, "PTP session opened (settled)")
         } catch (t: Throwable) {
             try { connection.releaseInterface(intf) } catch (_: Throwable) {}
             throw t
@@ -175,30 +193,91 @@ class PtpClient(
 
     // ------------------------------------------------------------- enumeration
 
-    fun listFiles(): List<MtpFile> {
+    fun listFiles(allowedExtensions: Set<String> = DEFAULT_MEDIA_EXTENSIONS): List<MtpFile> {
+        val normalizedExtensions = allowedExtensions.map { it.lowercase() }.toSet()
         val all = mutableListOf<MtpFile>()
         val storageIds = getStorageIds()
         Log.i(TAG, "PTP storages=${storageIds.toList()}")
         for (storageId in storageIds) {
-            // 0xFFFFFFFF means "all objects in storage" (recursive flat listing) per
-            // PTP spec — saves us from manual depth-first traversal.
-            val handles = getObjectHandles(storageId, format = 0, parent = -1)
-            Log.i(TAG, "PTP storage=0x${storageId.toString(16)} handles=${handles.size}")
-            for (handle in handles) {
-                val info = try {
-                    getObjectInfo(handle)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "GetObjectInfo($handle) failed: ${t.message}")
-                    continue
-                } ?: continue
+            // PTP semantics for `parent` vary by camera:
+            //   - Nikon Z f: parent=0 returns ALL objects flat (files + dirs)
+            //   - Other bodies: parent=0 may return only root-level children (just DCIM/)
+            // Strategy: ask for parent=0, classify each handle by format. If we find
+            //   any non-directory file, trust the flat listing. If every handle is a
+            //   directory (FMT_ASSOCIATION), recurse into them.
+            val rootHandles = getObjectHandles(storageId, format = 0, parent = 0)
+            Log.i(TAG, "PTP storage=0x${storageId.toString(16)} rootHandles=${rootHandles.size}")
+            if (rootHandles.isEmpty()) continue
 
-                if (info.format == FMT_ASSOCIATION) continue
-                val ext = info.name.substringAfterLast('.', "").lowercase()
-                if (ext !in EXTENSIONS) continue
-                all += info
+            val rootInfos = rootHandles.toList().mapNotNull { h ->
+                try { getObjectInfo(h) } catch (t: Throwable) {
+                    Log.w(TAG, "GetObjectInfo($h) failed: ${t.message}")
+                    null
+                }
+            }
+            val rootNonDirCount = rootInfos.count { it.format != FMT_ASSOCIATION }
+            val flatMode = rootNonDirCount > 0
+            Log.i(TAG, "PTP storage=0x${storageId.toString(16)} flatMode=$flatMode (non-dirs at root=$rootNonDirCount)")
+
+            if (flatMode) {
+                // Flat listing — root already contains the files and usually the
+                // directory association objects needed to reconstruct paths.
+                val dirs = rootInfos
+                    .filter { it.format == FMT_ASSOCIATION }
+                    .associateBy { it.handle }
+                for (info in rootInfos) {
+                    if (info.format == FMT_ASSOCIATION) continue
+                    if (info.extension in normalizedExtensions) {
+                        all += info.copy(directoryPath = directoryPathFor(info.parentHandle, dirs))
+                    }
+                }
+            } else {
+                // Recursive traversal — walk subdirectories
+                val stack = ArrayDeque<Pair<Int, String>>()
+                for (info in rootInfos) {
+                    if (info.format == FMT_ASSOCIATION) {
+                        stack.addLast(info.handle to childPath("/", info.name))
+                    }
+                }
+                while (stack.isNotEmpty()) {
+                    val (parent, parentPath) = stack.removeLast()
+                    val children = try {
+                        getObjectHandles(storageId, format = 0, parent = parent)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "GetObjectHandles(parent=$parent) failed: ${t.message}")
+                        continue
+                    }
+                    for (ch in children) {
+                        val info = try { getObjectInfo(ch) } catch (_: Throwable) { null } ?: continue
+                        if (info.format == FMT_ASSOCIATION) {
+                            stack.addLast(ch to childPath(parentPath, info.name))
+                        } else {
+                            if (info.extension in normalizedExtensions) {
+                                all += info.copy(directoryPath = parentPath)
+                            }
+                        }
+                    }
+                }
             }
         }
         return all
+    }
+
+    private fun directoryPathFor(parentHandle: Int, dirs: Map<Int, MtpFile>): String {
+        if (parentHandle == 0 || parentHandle == -1) return "/"
+        val parts = mutableListOf<String>()
+        var current = parentHandle
+        var guard = 0
+        while (current != 0 && current != -1 && guard++ < 64) {
+            val dir = dirs[current] ?: break
+            parts += dir.name
+            current = dir.parentHandle
+        }
+        return if (parts.isEmpty()) "/" else "/" + parts.asReversed().joinToString("/")
+    }
+
+    private fun childPath(parent: String, child: String): String {
+        return if (parent == "/") "/$child" else "$parent/$child"
     }
 
     fun getStorageIds(): IntArray {
@@ -235,7 +314,12 @@ class PtpClient(
                 Log.w(TAG, "GetObjectInfo($handle) bad response 0x${resp.code.toString(16)}")
                 return@withTransportRecovery null
             }
-            parseObjectInfo(handle, data)
+            val result = parseObjectInfo(handle, data)
+            if (result == null) {
+                val hex = data.take(64).joinToString(" ") { "%02x".format(it) }
+                Log.w(TAG, "GetObjectInfo($handle) parse null: dataSize=${data.size} hex=$hex")
+            }
+            result
         }
     }
 
@@ -249,23 +333,29 @@ class PtpClient(
     fun copyObjectTo(handle: Int, expectedSize: Long, output: OutputStream, onProgress: (Long) -> Unit) {
         sendCommand(OP_GET_OBJECT, intArrayOf(handle))
 
-        // Read 12-byte data container header.
-        val header = ByteArray(12)
-        val hn = connection.bulkTransfer(bulkIn, header, 12, OBJECT_TIMEOUT_MS)
-        if (hn != 12) throw IOException("GetObject: header read $hn != 12")
-        val length = (ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong()) and 0xFFFFFFFFL
-        val type = ByteBuffer.wrap(header, 4, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+        // Read first chunk with a full-sized buffer to avoid -EOVERFLOW on USB 3.0
+        // (device sends header + initial payload bytes in one USB packet).
+        val buf = ByteArray(MAX_BULK_BYTES)
+        val firstN = connection.bulkTransfer(bulkIn, buf, buf.size, OBJECT_TIMEOUT_MS)
+        if (firstN < 12) throw IOException("GetObject: first read $firstN < 12")
+        val length = (ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong()) and 0xFFFFFFFFL
+        val type = ByteBuffer.wrap(buf, 4, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
         if (type != TYPE_DATA) throw IOException("GetObject: expected data container, got type=$type")
 
         val dataLen = length - 12
         if (dataLen < 0) throw IOException("GetObject: dataLen<0 ($dataLen)")
-        // Sanity-check against caller-supplied size (camera-reported file size).
         if (expectedSize > 0 && dataLen != expectedSize) {
             Log.w(TAG, "GetObject($handle): header data=$dataLen but ObjectInfo size=$expectedSize — using header value")
         }
 
-        val buf = ByteArray(MAX_BULK_BYTES)
-        var read = 0L
+        // Write payload bytes already received in the first read.
+        val firstPayload = firstN - 12
+        if (firstPayload > 0) {
+            output.write(buf, 12, firstPayload)
+            onProgress(firstPayload.toLong())
+        }
+
+        var read = firstPayload.toLong()
         while (read < dataLen) {
             val want = minOf(buf.size.toLong(), dataLen - read).toInt()
             val n = connection.bulkTransfer(bulkIn, buf, want, OBJECT_TIMEOUT_MS)
@@ -403,11 +493,10 @@ class PtpClient(
     private data class Response(val code: Int, val params: IntArray)
 
     private fun readResponse(): Response {
-        // Skip up to a few stale containers in the IN pipe before the real one.
-        // com.android.mtp may have left an old response in the queue, and our
-        // sendCommand wouldn't drain it; we'd otherwise mis-parse it as ours.
+        // Use a large buffer to avoid -EOVERFLOW on USB 3.0 SuperSpeed —
+        // the device may bundle data + response in one packet.
         repeat(STALE_SKIP_MAX) {
-            val buf = ByteArray(64)
+            val buf = ByteArray(MAX_BULK_BYTES)
             val n = connection.bulkTransfer(bulkIn, buf, buf.size, COMMAND_TIMEOUT_MS)
             if (n < 12) throw IOException("PTP response: read $n bytes")
             val bb = ByteBuffer.wrap(buf, 0, n).order(ByteOrder.LITTLE_ENDIAN)
@@ -451,21 +540,27 @@ class PtpClient(
      * Read a complete PTP data container (header + body) into a single byte[].
      * Used for small payloads (StorageIDs, ObjectInfo, etc.) — large file payloads
      * stream via [copyObjectTo].
+     *
+     * IMPORTANT: on USB 3.0 SuperSpeed (maxPkt=1024), the device sends the entire
+     * container as one USB packet when it fits. Reading only 12 bytes for the header
+     * causes -EOVERFLOW if the container is larger. We therefore read the first chunk
+     * with a full-sized buffer and parse header + (possibly partial) payload from it.
      */
     private fun readData(): ByteArray {
-        // Skip stale containers first (same rationale as readResponse).
         repeat(STALE_SKIP_MAX) {
-            val header = ByteArray(12)
-            val hn = connection.bulkTransfer(bulkIn, header, 12, COMMAND_TIMEOUT_MS)
-            if (hn != 12) throw IOException("PTP data: header $hn != 12")
-            val length = (ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong()) and 0xFFFFFFFFL
-            val type = ByteBuffer.wrap(header, 4, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-            val txn = ByteBuffer.wrap(header, 8, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            val buf = ByteArray(MAX_BULK_BYTES)
+            val n = connection.bulkTransfer(bulkIn, buf, buf.size, COMMAND_TIMEOUT_MS)
+            if (n < 12) throw IOException("PTP data: first read $n < 12")
+            val bb = ByteBuffer.wrap(buf, 0, n).order(ByteOrder.LITTLE_ENDIAN)
+            val length = bb.int.toLong() and 0xFFFFFFFFL
+            val type = bb.short.toInt() and 0xFFFF
+            bb.short // code (unused here)
+            val txn = bb.int
 
             if (txn != lastSentTxn) {
                 Log.w(TAG, "stale PTP container: type=$type txn=$txn (expected $lastSentTxn); discarding ${length}B")
-                val payload = (length - 12).toInt()
-                if (payload > 0) skipBytes(payload)
+                val remaining = (length - n).toInt()
+                if (remaining > 0) skipBytes(remaining)
                 return@repeat
             }
             if (type != TYPE_DATA) throw IOException("PTP data: type=$type expected $TYPE_DATA")
@@ -473,12 +568,15 @@ class PtpClient(
             if (payloadLen <= 0) return ByteArray(0)
 
             val out = ByteArray(payloadLen)
-            var read = 0
+            // Copy payload bytes already received in the first read.
+            val already = minOf(n - 12, payloadLen)
+            System.arraycopy(buf, 12, out, 0, already)
+            var read = already
             while (read < payloadLen) {
                 val want = minOf(MAX_BULK_BYTES, payloadLen - read)
-                val n = connection.bulkTransfer(bulkIn, out, read, want, COMMAND_TIMEOUT_MS)
-                if (n <= 0) throw IOException("PTP data: bulkTransfer $n at $read of $payloadLen")
-                read += n
+                val got = connection.bulkTransfer(bulkIn, out, read, want, COMMAND_TIMEOUT_MS)
+                if (got <= 0) throw IOException("PTP data: bulkTransfer $got at $read of $payloadLen")
+                read += got
             }
             return out
         }
@@ -494,7 +592,9 @@ class PtpClient(
      *   uint32 objectCompressedSize     (32-bit; for >4 GiB use ObjectInfo64 / props)
      *   uint16 thumbFormat ... thumbCompressedSize, thumbPixWidth/Height,
      *   uint32 imagePixWidth, imagePixHeight, imageBitDepth
-     *   uint32 parentObject, associationType, associationDesc, sequenceNumber
+     *   uint32 parentObject
+     *   uint16 associationType        ← NOTE: uint16, not uint32!
+     *   uint32 associationDesc, sequenceNumber
      *   PTP-string filename
      *   PTP-string captureDate         "YYYYMMDDThhmmss" (with optional ".s" fractional)
      *   PTP-string modificationDate
@@ -503,16 +603,19 @@ class PtpClient(
     private fun parseObjectInfo(handle: Int, data: ByteArray): MtpFile? {
         if (data.size < 52) return null
         val bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-        bb.int // storageId
+        val storageId = bb.int
         val format = bb.short.toInt() and 0xFFFF
         bb.short // protectionStatus
         val compressedSize = bb.int.toLong() and 0xFFFFFFFFL
-        // Skip thumb fields: uint16 thumbFormat, uint32 thumbCompressedSize, 4*uint32
-        bb.short
-        bb.int
-        bb.int; bb.int
-        bb.int; bb.int; bb.int
-        bb.int; bb.int; bb.int; bb.int
+        // Skip thumb fields + image dimensions + parent/association/sequence
+        bb.short                          // thumbFormat (uint16)
+        bb.int                            // thumbCompressedSize (uint32)
+        bb.int; bb.int                    // thumbPixWidth, thumbPixHeight (uint32 x2)
+        bb.int; bb.int; bb.int            // imagePixWidth, imagePixHeight, imageBitDepth (uint32 x3)
+        val parentObject = bb.int        // parentObject (uint32)
+        bb.short                          // associationType (uint16!)
+        bb.int                            // associationDesc (uint32)
+        bb.int                            // sequenceNumber (uint32)
 
         val name = readPtpString(bb) ?: return null
         val captureDate = readPtpString(bb)
@@ -525,6 +628,8 @@ class PtpClient(
             size = compressedSize,
             dateModifiedMillis = captureMillis,
             format = format,
+            storageId = storageId,
+            parentHandle = parentObject,
         )
     }
 

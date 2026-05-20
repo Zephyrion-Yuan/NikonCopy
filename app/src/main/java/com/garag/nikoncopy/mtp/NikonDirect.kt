@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -20,12 +21,16 @@ private const val NIKON_VID = 0x04B0    // 1200 — Nikon Corporation
 
 private const val ACTION_USB_PERMISSION = "com.garag.nikoncopy.USB_PERMISSION"
 
+data class OpenedPtpDevice(
+    val client: PtpClient,
+    val deviceKey: String,
+    val deviceName: String,
+)
+
 object NikonDirect {
 
     /**
      * Locate a connected Nikon-branded camera. Returns the first match.
-     * Note: PIDs vary per model; we filter on VID only and let interface-class
-     * matching (class=6 still-image) below confirm it's a PTP-capable camera.
      */
     fun findNikon(context: Context): UsbDevice? {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return null
@@ -46,10 +51,50 @@ object NikonDirect {
         return ptpCamera
     }
 
-    /**
-     * Pick the still-image PTP interface (class=6, subclass=1, protocol=1) on the
-     * device. Returns null if not present.
-     */
+    fun findPtpCamera(context: Context, preferredDeviceKey: String? = null): UsbDevice? {
+        val usbManager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return null
+        val cameras = usbManager.deviceList.values.filter { dev ->
+            (0 until dev.interfaceCount).any { i ->
+                dev.getInterface(i).interfaceClass == UsbConstants.USB_CLASS_STILL_IMAGE
+            }
+        }
+        if (cameras.isEmpty()) {
+            Log.i(TAG, "no PTP cameras in deviceList (size=${usbManager.deviceList.size})")
+            return null
+        }
+        if (preferredDeviceKey != null) {
+            cameras.firstOrNull { deviceKey(it) == preferredDeviceKey }?.let { return it }
+        }
+        return cameras.firstOrNull { it.vendorId == NIKON_VID } ?: cameras.first()
+    }
+
+    fun deviceKey(device: UsbDevice): String {
+        val manufacturer = runCatching { device.manufacturerName }.getOrNull()
+            ?.sanitizeKeyPart()
+            .orEmpty()
+        val product = runCatching { device.productName }.getOrNull()
+            ?.sanitizeKeyPart()
+            .orEmpty()
+        return buildString {
+            append("%04x:%04x".format(device.vendorId, device.productId))
+            if (manufacturer.isNotBlank() || product.isNotBlank()) {
+                append(":")
+                append(manufacturer)
+                append(":")
+                append(product)
+            }
+        }
+    }
+
+    fun deviceDisplayName(device: UsbDevice): String {
+        val manufacturer = runCatching { device.manufacturerName }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+        val product = runCatching { device.productName }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+        return listOfNotNull(manufacturer, product).joinToString(" ")
+            .ifBlank { "PTP Camera %04x:%04x".format(device.vendorId, device.productId) }
+    }
+
     fun findPtpInterface(device: UsbDevice): android.hardware.usb.UsbInterface? {
         for (i in 0 until device.interfaceCount) {
             val intf = device.getInterface(i)
@@ -60,14 +105,6 @@ object NikonDirect {
         return null
     }
 
-    /**
-     * Request USB permission for [device] from the user. Suspends until the system
-     * dialog is dismissed (granted or not). Returns true on grant.
-     *
-     * Implementation: register a private broadcast receiver, fire the system's
-     * permission dialog with a PendingIntent that resolves to that broadcast,
-     * resume on receipt.
-     */
     suspend fun ensurePermission(context: Context, device: UsbDevice): Boolean {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
         if (usbManager.hasPermission(device)) return true
@@ -84,7 +121,6 @@ object NikonDirect {
                 }
             }
 
-            // Android 14 requires explicit export flags; receiver is private to our package.
             val filter = IntentFilter(ACTION_USB_PERMISSION)
             val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 ContextCompat.RECEIVER_NOT_EXPORTED
@@ -106,91 +142,115 @@ object NikonDirect {
     }
 
     /**
-     * Open a [PtpClient] against a connected Nikon. Returns null with a logged
-     * reason if the camera isn't present, permission was denied, or claim failed.
-     *
-     * NOTE: this force-claims interface 0, kicking out `com.android.mtp` if it
-     * had the device. SAF-based access to Nikon won't work while we hold it.
-     * Closing the returned PtpClient releases the interface and SAF resumes.
+     * Check whether direct PTP should be enabled. Auto-enables when
+     * `com.android.mtp` is disabled (no session competition).
+     * When MTP provider is active, direct PTP causes endpoint deadlocks.
      */
-    /**
-     * On Android 16 (SDK 36) the direct-PTP path is non-functional:
-     *   - `Os.utimensat` reflection blocked (`core-platform-api` denial)
-     *   - `setHiddenApiExemptions` itself blocked (no bypass for #1)
-     *   - `Os.ioctlInt` blocked → `USBDEVFS_RESET` ioctl unavailable
-     *
-     * Without USBDEVFS_RESET we can't evict `com.android.mtp` from the camera, so
-     * our PTP commands are silently rejected (bulk OUT returns -1 immediately).
-     *
-     * Set this to `false` to permanently route through SAF. Re-enable when
-     * targeting older Android, or when a privileged USB-reset path is added.
-     */
-    private const val ENABLE_DIRECT_PTP = false
+    fun isDirectPtpAvailable(context: Context): Boolean {
+        return isMtpProviderDisabled(context).also { enabled ->
+            Log.i(TAG, "isDirectPtpAvailable=$enabled (com.android.mtp disabled=$enabled)")
+        }
+    }
 
-    suspend fun open(context: Context): PtpClient? {
-        if (!ENABLE_DIRECT_PTP) {
-            Log.i(TAG, "direct PTP disabled (Android 16 hidden-API restrictions)")
+    private fun isMtpProviderDisabled(context: Context): Boolean {
+        return try {
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                PackageManager.ApplicationInfoFlags.of(0)
+            } else {
+                @Suppress("DEPRECATION")
+                null
+            }
+            val info = if (flags != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getApplicationInfo("com.android.mtp", flags)
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getApplicationInfo("com.android.mtp", 0)
+            }
+            !info.enabled
+        } catch (_: PackageManager.NameNotFoundException) {
+            // Package not present at all — safe to use direct PTP
+            true
+        }
+    }
+
+    /**
+     * Open a [PtpClient] against a connected Nikon.
+     *
+     * With `com.android.mtp` disabled, the USB stack often re-enumerates the
+     * device ~1 s after the first session open (no MTP handler → port reset).
+     * We handle this by probing with GetStorageIDs; if the probe fails we
+     * wait for the device to reappear and open a fresh PtpClient on the
+     * re-enumerated device.
+     */
+    suspend fun open(context: Context): PtpClient? = openDevice(context)?.client
+
+    suspend fun openDevice(context: Context, preferredDeviceKey: String? = null): OpenedPtpDevice? {
+        if (!isDirectPtpAvailable(context)) {
+            Log.i(TAG, "direct PTP unavailable (com.android.mtp still enabled)")
             return null
         }
-        val device = findNikon(context) ?: return null.also {
-            Log.w(TAG, "open: no Nikon device")
-        }
-        val intf = findPtpInterface(device) ?: return null.also {
-            Log.w(TAG, "open: no PTP interface")
-        }
-        if (!ensurePermission(context, device)) return null.also {
-            Log.w(TAG, "open: permission denied")
-        }
-        val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
-        // First attempt: open + try to use the device as-is.
-        val firstConn = usbManager.openDevice(device) ?: return null.also {
-            Log.w(TAG, "open: openDevice returned null")
-        }
-        try {
-            return PtpClient(firstConn, intf)
-        } catch (t: Throwable) {
-            Log.w(TAG, "open: first PtpClient ctor failed (${t.message}); attempting USBDEVFS_RESET")
-        }
+        for (attempt in 1..3) {
+            val device = findPtpCamera(context, preferredDeviceKey) ?: return null.also {
+                Log.w(TAG, "open[$attempt]: no PTP camera")
+            }
+            val intf = findPtpInterface(device) ?: return null.also {
+                Log.w(TAG, "open[$attempt]: no PTP interface")
+            }
+            if (!ensurePermission(context, device)) return null.also {
+                Log.w(TAG, "open[$attempt]: permission denied")
+            }
+            val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
-        // Second attempt: full USB device reset via ioctl, then re-open. The reset
-        // re-enumerates the device — even com.android.mtp loses its handle, so the
-        // camera-side PTP state is forced fresh.
-        try {
-            val reset = PtpClient.tryIoctlResetWithoutSession(firstConn)
-            try { firstConn.close() } catch (_: Throwable) {}
-            if (!reset) {
-                Log.w(TAG, "open: USBDEVFS_RESET failed; giving up on direct path")
+            val conn = usbManager.openDevice(device) ?: return null.also {
+                Log.w(TAG, "open[$attempt]: openDevice returned null")
+            }
+            val ptp = try {
+                PtpClient(conn, intf, cleanConnection = true)
+            } catch (t: Throwable) {
+                Log.w(TAG, "open[$attempt]: PtpClient ctor failed: ${t.message}")
+                try { conn.close() } catch (_: Throwable) {}
+                if (attempt < 3) {
+                    Log.i(TAG, "open[$attempt]: waiting for USB re-enumeration...")
+                    kotlinx.coroutines.delay(2500)
+                    continue
+                }
                 return null
             }
-        } catch (t: Throwable) {
-            Log.w(TAG, "open: reset attempt threw: ${t.message}")
-            try { firstConn.close() } catch (_: Throwable) {}
-            return null
+
+            // Health check: if GetStorageIDs works, the connection is alive.
+            val healthy = try {
+                ptp.getStorageIds()
+                true
+            } catch (_: Throwable) {
+                false
+            }
+
+            if (healthy) {
+                val key = deviceKey(device)
+                val name = deviceDisplayName(device)
+                Log.i(TAG, "open[$attempt]: connection verified key=$key name=$name")
+                return OpenedPtpDevice(ptp, key, name)
+            }
+
+            Log.w(TAG, "open[$attempt]: health check failed; USB port likely re-enumerating")
+            try { ptp.close() } catch (_: Throwable) {}
+
+            if (attempt < 3) {
+                // Wait for the device to disconnect and reappear
+                Log.i(TAG, "open[$attempt]: waiting for USB re-enumeration...")
+                kotlinx.coroutines.delay(2500)
+            }
         }
 
-        // Wait for the device to re-enumerate, then look it up again — UsbDevice
-        // identity is tied to the bus path, which usually survives a reset, but
-        // we re-fetch defensively.
-        kotlinx.coroutines.delay(800)
-        val device2 = findNikon(context) ?: return null.also {
-            Log.w(TAG, "open: post-reset no Nikon found")
-        }
-        val intf2 = findPtpInterface(device2) ?: return null.also {
-            Log.w(TAG, "open: post-reset no PTP interface")
-        }
-        if (!ensurePermission(context, device2)) return null.also {
-            Log.w(TAG, "open: post-reset permission denied")
-        }
-        val secondConn = usbManager.openDevice(device2) ?: return null.also {
-            Log.w(TAG, "open: post-reset openDevice null")
-        }
-        return try {
-            PtpClient(secondConn, intf2)
-        } catch (t: Throwable) {
-            Log.e(TAG, "open: post-reset PtpClient ctor still failed", t)
-            try { secondConn.close() } catch (_: Throwable) {}
-            null
-        }
+        Log.e(TAG, "open: all attempts exhausted")
+        return null
+    }
+
+    private fun String.sanitizeKeyPart(): String {
+        return trim()
+            .lowercase()
+            .replace(Regex("""\s+"""), "_")
+            .replace(Regex("""[^a-z0-9_.-]"""), "")
     }
 }

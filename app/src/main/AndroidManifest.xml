@@ -25,20 +25,15 @@
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:screenOrientation="portrait"
             android:theme="@style/Theme.NikonCopy">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Show NikonCopy in the system chooser when a Nikon camera (VID 1200)
-                 attaches via OTG. Picking us auto-grants USB permission, which lets
-                 PtpClient force-claim interface 0 without the runtime dialog. -->
-            <intent-filter>
-                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
-            </intent-filter>
-            <meta-data
-                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-                android:resource="@xml/usb_device_filter" />
+            <!-- USB_DEVICE_ATTACHED intent-filter removed: the HyperOS "default app"
+                 confirmation dialog is persistent despite user confirmation. We request
+                 USB permission at copy time via UsbManager.requestPermission() instead. -->
         </activity>
 
         <service

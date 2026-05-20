@@ -4,10 +4,8 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
-import android.database.Cursor
-import android.media.MediaScannerConnection
 import android.net.Uri
-import android.os.FileUtils
+import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.system.Os
@@ -37,51 +35,48 @@ import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "CopyEngine"
 
-private val EXTENSIONS = setOf("nef", "jpg", "jpeg", "mp4")
-private val EXIF_EXTS = setOf("nef", "jpg", "jpeg")
+private val EXIF_EXTS = setOf("nef", "arw", "dng", "jpg", "jpeg", "heif", "heic", "hif")
 private val MEDIASTORE_ROOTS = setOf("Pictures", "DCIM", "Movies")
-
-private data class SourceFile(
-    val docUri: Uri,
-    val name: String,
-    val size: Long,
-    val lastModified: Long,
-    val mimeType: String?,
-)
-
-private data class EnrichTask(val src: SourceFile, val dstUri: Uri, val isMediaStore: Boolean)
 
 class CopyEngine(
     private val context: Context,
     private val manifest: ManifestStore,
 ) {
 
-    fun copyFlow(
-        sourceTreeUri: Uri,
+    /**
+     * Direct-mode copy flow: source is a [PtpClient] holding the Nikon's USB
+     * interface 0 directly and bypasses `com.android.mtp` entirely.
+     *
+     * Caller is responsible for opening the PtpClient (USB perm, claim) and closing
+     * it after the flow completes. We do NOT close it here so the caller can decide
+     * lifetime (e.g. keep open across multiple back-to-back copies).
+     */
+    fun copyFlowDirect(
+        ptp: PtpClient,
         destinationTreeUri: Uri,
         mode: CopyMode,
+        filter: CopyFilter = CopyFilter(),
     ): Flow<CopyState> = channelFlow {
         send(CopyState.Scanning(0))
         val resolver = context.contentResolver
 
-        val existingNames = readDestinationNames(resolver, destinationTreeUri)
-        val manifestNames = if (mode == CopyMode.INCREMENTAL) manifest.loadAll() else emptySet()
-        Log.i(TAG, "mode=$mode existingNames=${existingNames.size} manifestNames=${manifestNames.size}")
+        val allManifest = manifest.loadAll()
+        val orphansCleaned = cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
+        val initialExisting = readDestinationNames(resolver, destinationTreeUri) - orphansCleaned
+        val diskRecovered = recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
+        val existingNames = initialExisting + diskRecovered
+        val manifestNames = if (mode == CopyMode.INCREMENTAL) allManifest else emptySet()
+        Log.i(TAG, "[direct] mode=$mode existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
 
-        // Walk source tree.
-        val candidates = mutableListOf<SourceFile>()
-        try {
-            walkTree(resolver, sourceTreeUri) { f ->
-                val ext = f.name.substringAfterLast('.', "").lowercase()
-                if (ext in EXTENSIONS) candidates += f
-            }
+        val candidates = try {
+            ptp.listFiles()
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
-            Log.e(TAG, "Scan failed", t)
-            send(CopyState.Failed("扫描失败: ${t.message ?: t.javaClass.simpleName}"))
+            Log.e(TAG, "[direct] PTP listFiles failed", t)
+            send(CopyState.Failed("PTP 列表失败: ${t.message ?: t.javaClass.simpleName}"))
             return@channelFlow
-        }
+        }.filter { filter.accepts(it.directoryPath, it.extension) }
 
         val (toCopy, toSkip) = candidates.partition { f ->
             when (mode) {
@@ -90,7 +85,7 @@ class CopyEngine(
             }
         }
         send(CopyState.Scanning(candidates.size))
-        Log.i(TAG, "candidates=${candidates.size} toCopy=${toCopy.size} toSkip=${toSkip.size}")
+        Log.i(TAG, "[direct] candidates=${candidates.size} toCopy=${toCopy.size} toSkip=${toSkip.size}")
 
         if (toCopy.isEmpty()) {
             send(CopyState.Done(
@@ -105,13 +100,12 @@ class CopyEngine(
         val grandTotalBytes = toCopy.sumOf { it.size.coerceAtLeast(0L) }
         val startNanos = System.nanoTime()
 
-        val perFileBytes = AtomicLong(0)         // bytes copied within current file
-        val priorTotalBytes = AtomicLong(0)      // bytes from already-completed files
+        val perFileBytes = AtomicLong(0)
+        val priorTotalBytes = AtomicLong(0)
         val currentIndex = AtomicInteger(0)
         val currentName = AtomicReference("(scanning)")
+        val pendingPostProcess = AtomicInteger(0)
 
-        // Periodic progress emitter — runs concurrently with the per-file copies and
-        // pulls progress out of the atomics every 200 ms.
         val emitterJob = launch {
             var lastEmitNanos = System.nanoTime()
             var lastEmitBytes = 0L
@@ -133,130 +127,218 @@ class CopyEngine(
                         bytesCopied = total,
                         totalBytes = grandTotalBytes,
                         bytesPerSecond = rate,
+                        phase = CopyState.Phase.COPYING,
+                        pendingPostProcess = 0,
                     ))
                 }
-            } catch (_: CancellationException) {
-                // expected on shutdown
-            }
+            } catch (_: CancellationException) {}
         }
 
         val session = manifest.openAppendSession()
+        val batch = manifest.openBatchSession()
         val destDir = DocumentsContract.buildDocumentUriUsingTree(
             destinationTreeUri,
             DocumentsContract.getTreeDocumentId(destinationTreeUri),
         )
-        // If destination is under Pictures/DCIM/Movies, prefer MediaStore.insert so
-        // we are recorded as the row's owner. That removes the SecurityException
-        // we'd otherwise hit on DATE_TAKEN updates — and DATE_TAKEN is the only
-        // way Xiaomi 相册 sorts NEF correctly (its native MediaScanner can't read
-        // NEF EXIF, so the column otherwise stays NULL forever).
+
         val mediaStoreRelPath = mediaStoreRelativePath(destinationTreeUri)
-        Log.i(TAG, "destination MediaStore relPath=$mediaStoreRelPath (null = SAF-only)")
+        Log.i(TAG, "[direct] destination MediaStore relPath=$mediaStoreRelPath")
+
+        var filesCopied = 0
+        var consecutiveErrors = 0
+        val failedFiles = mutableListOf<MtpFile>()
+        var usbDead = false
+
+        /**
+         * Attempt to copy one file. Returns copiedBytes on success, -1 on failure.
+         * Handles destination URI creation + cleanup on error.
+         */
+        suspend fun attemptCopy(mtpFile: MtpFile, attemptLabel: String): Long {
+            val mime = guessMime(mtpFile.name)
+            val (newDoc, isMediaStore) = try {
+                createDestinationUri(resolver, destDir, mediaStoreRelPath, mtpFile.name, mime)
+            } catch (t: Throwable) {
+                Log.e(TAG, "[direct] $attemptLabel createDocument failed for ${mtpFile.name}: ${t.message}")
+                return -1
+            }
+
+            val fileStartNanos = System.nanoTime()
+            val copiedBytes = try {
+                withContext(Dispatchers.IO) {
+                    copyOneViaPtp(ptp, mtpFile, newDoc) { bytes -> perFileBytes.set(bytes) }
+                }
+            } catch (ce: CancellationException) {
+                // Cancelled mid-transfer — delete the partial row so it doesn't
+                // orphan the slot (preventing re-copy on next run).
+                runCatching {
+                    if (isMediaStore) resolver.delete(newDoc, null, null)
+                    else DocumentsContract.deleteDocument(resolver, newDoc)
+                }.onSuccess {
+                    Log.i(TAG, "[direct] $attemptLabel cancelled mid-copy, cleaned partial ${mtpFile.name}")
+                }
+                throw ce
+            } catch (t: Throwable) {
+                Log.e(TAG, "[direct] $attemptLabel PTP copy failed for ${mtpFile.name}: ${t.message}")
+                runCatching {
+                    if (isMediaStore) resolver.delete(newDoc, null, null)
+                    else DocumentsContract.deleteDocument(resolver, newDoc)
+                }
+                return -1
+            }
+            val fileMs = (System.nanoTime() - fileStartNanos) / 1_000_000L
+            val fileMBs = if (fileMs > 0) copiedBytes / 1024.0 / 1024.0 / (fileMs / 1000.0) else 0.0
+            Log.i(TAG, "[direct] $attemptLabel ${mtpFile.name} ${copiedBytes}B in ${fileMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf]"}".format(fileMBs))
+
+            priorTotalBytes.addAndGet(copiedBytes)
+            perFileBytes.set(0)
+
+            session.add(mtpFile.name)
+            batch.add(mtpFile.name, isMediaStore, newDoc)
+            // Note: do NOT publish (IS_PENDING=1 stays). fix-dates will
+            // publish with DATE_TAKEN in one update to avoid Xiaomi Gallery
+            // caching a null DATE_TAKEN at first-index time.
+            return copiedBytes
+        }
 
         try {
-            for ((idx, src) in toCopy.withIndex()) {
+            // -------- First pass: one attempt per file --------
+            for ((idx, mtpFile) in toCopy.withIndex()) {
                 currentIndex.set(idx + 1)
-                currentName.set(src.name)
+                currentName.set(mtpFile.name)
                 perFileBytes.set(0)
 
-                val mime = src.mimeType ?: guessMime(src.name)
-                val (newDoc, isMediaStore) = try {
-                    createDestinationUri(resolver, destDir, mediaStoreRelPath, src.name, mime)
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (t: Throwable) {
-                    Log.e(TAG, "createDocument failed for ${src.name}", t)
-                    emitterJob.cancelAndJoin()
-                    send(CopyState.Failed("创建文件失败 (${src.name}): ${t.message ?: t.javaClass.simpleName}"))
-                    return@channelFlow
-                }
-
-                val fileStartNanos = System.nanoTime()
-                val copiedBytes = try {
-                    withContext(Dispatchers.IO) {
-                        copyOneViaFileUtils(resolver, src.docUri, newDoc, src.name) { progress ->
-                            perFileBytes.set(progress)
+                val bytes = attemptCopy(mtpFile, "try1")
+                if (bytes < 0) {
+                    failedFiles += mtpFile
+                    consecutiveErrors++
+                    if (consecutiveErrors >= 4) {
+                        Log.e(TAG, "[direct] 4 consecutive failures — USB likely dead, stopping main pass")
+                        usbDead = true
+                        // Remaining un-attempted files also need retry later
+                        val remainingStart = idx + 1
+                        if (remainingStart < toCopy.size) {
+                            failedFiles += toCopy.subList(remainingStart, toCopy.size)
                         }
+                        break
                     }
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Copy failed for ${src.name}", t)
-                    runCatching {
-                        if (isMediaStore) resolver.delete(newDoc, null, null)
-                        else DocumentsContract.deleteDocument(resolver, newDoc)
+                    continue
+                }
+                consecutiveErrors = 0
+                filesCopied++
+            }
+
+            // -------- End-of-batch retry pass: up to 3 more attempts per failed file --------
+            if (failedFiles.isNotEmpty()) {
+                Log.i(TAG, "[direct] end-of-batch retry: ${failedFiles.size} files")
+                val stillFailed = mutableListOf<MtpFile>()
+                for (mtpFile in failedFiles) {
+                    currentName.set(mtpFile.name)
+                    perFileBytes.set(0)
+                    var recovered = false
+                    for (attempt in 2..4) {
+                        val bytes = attemptCopy(mtpFile, "try$attempt")
+                        if (bytes >= 0) {
+                            recovered = true
+                            filesCopied++
+                            break
+                        }
+                        // brief pause between attempts
+                        kotlinx.coroutines.delay(300)
                     }
-                    emitterJob.cancelAndJoin()
-                    send(CopyState.Failed("拷贝失败 (${src.name}): ${t.message ?: t.javaClass.simpleName}"))
-                    return@channelFlow
+                    if (!recovered) stillFailed += mtpFile
                 }
-                val fileDurationMs = (System.nanoTime() - fileStartNanos) / 1_000_000L
-                val fileRateMBs = if (fileDurationMs > 0) copiedBytes / 1024.0 / 1024.0 / (fileDurationMs / 1000.0) else 0.0
-                Log.i(TAG, "copied ${src.name} ${copiedBytes}B in ${fileDurationMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf]"}".format(fileRateMBs))
-
-                priorTotalBytes.addAndGet(copiedBytes)
-                perFileBytes.set(0)
-
-                // Capture time → DATE_TAKEN (and mtime if utimensat is available).
-                enrichDestination(resolver, src, newDoc, isMediaStore)
-
-                // Publish the MediaStore entry now that the bytes are written.
-                if (isMediaStore) {
-                    runCatching {
-                        val v = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-                        resolver.update(newDoc, v, null, null)
-                    }.onFailure { Log.w(TAG, "IS_PENDING=0 failed for ${src.name}: ${it.message}") }
-                }
-
-                session.add(src.name)
+                failedFiles.clear()
+                failedFiles += stillFailed
+                Log.i(TAG, "[direct] after retry: ${failedFiles.size} still failed")
             }
         } finally {
             session.close()
+            batch.close()
             emitterJob.cancelAndJoin()
         }
 
         val elapsed = (System.nanoTime() - startNanos) / 1_000_000L
         val totalBytes = priorTotalBytes.get()
         val avgMBs = if (elapsed > 0) totalBytes / 1024.0 / 1024.0 / (elapsed / 1000.0) else 0.0
-        Log.i(TAG, "Done: ${toCopy.size} files, $totalBytes B in ${elapsed}ms = %.1f MB/s avg".format(avgMBs))
+        Log.i(TAG, "[direct] Done: copied=$filesCopied failed=${failedFiles.size} skipped=${toSkip.size} $totalBytes B in ${elapsed}ms = %.1f MB/s avg".format(avgMBs))
 
-        send(CopyState.Done(
-            filesCopied = toCopy.size,
-            filesSkipped = toSkip.size,
-            totalBytes = totalBytes,
-            elapsedMillis = elapsed,
-        ))
+        if (filesCopied == 0 && usbDead) {
+            send(CopyState.Failed("USB 连接断开，未能拷贝任何文件"))
+        } else {
+            send(CopyState.Done(
+                filesCopied = filesCopied,
+                filesSkipped = toSkip.size,
+                totalBytes = totalBytes,
+                elapsedMillis = elapsed,
+            ))
+        }
     }.flowOn(Dispatchers.IO)
 
-    /**
-     * Direct-mode copy flow: source is a [PtpClient] holding the Nikon's USB
-     * interface 0 directly (bypasses `com.android.mtp` entirely). Same destination
-     * + manifest + EXIF/DATE_TAKEN logic as [copyFlow]; only the byte-pumping side
-     * is different.
-     *
-     * Caller is responsible for opening the PtpClient (USB perm, claim) and closing
-     * it after the flow completes. We do NOT close it here so the caller can decide
-     * lifetime (e.g. keep open across multiple back-to-back copies).
-     */
-    fun copyFlowDirect(
+    private fun copyOneViaPtp(
         ptp: PtpClient,
+        file: MtpFile,
+        dstUri: Uri,
+        onProgress: (Long) -> Unit,
+    ): Long {
+        val pfd = context.contentResolver.openFileDescriptor(dstUri, "w")
+            ?: throw IOException("openDst null: ${file.name}")
+        return pfd.use { p ->
+            FileOutputStream(p.fileDescriptor).use { fos ->
+                ptp.copyObjectTo(file.handle, file.size, fos, onProgress)
+                fos.flush()
+            }
+            file.size  // PTP container length matches; could read .size from copyObjectTo's dataLen
+        }
+    }
+
+    // ----------------------------------------------------------------- SAF copy
+
+    /** A single source file discovered while walking a SAF tree. */
+    private data class SafFile(
+        val docUri: Uri,
+        val name: String,
+        val size: Long,
+        val lastModified: Long,
+        val parentPath: String,
+        val extension: String,
+    )
+
+    /**
+     * MSC / SAF-source copy flow. Source is a SAF tree URI (e.g. mounted SD card,
+     * USB stick, or any directory the user can pick via OPEN_DOCUMENT_TREE).
+     * Same destination + manifest + EXIF/DATE_TAKEN enrichment as [copyFlowDirect];
+     * only the source enumeration & byte-pump differ.
+     *
+     * Walking strategy mirrors [com.garag.nikoncopy.data.MediaProbe]: skip
+     * Android system / hidden / trash dirs, prefer convention dirs, but here we
+     * walk the *full* tree because the user has explicitly opted into copying
+     * everything that the [filter] accepts. The CopyFilter is the actual
+     * "what to import" gate; the skip-dirs list just keeps us out of garbage.
+     */
+    fun copyFlowSaf(
+        sourceTreeUri: Uri,
         destinationTreeUri: Uri,
         mode: CopyMode,
+        filter: CopyFilter = CopyFilter(),
     ): Flow<CopyState> = channelFlow {
         send(CopyState.Scanning(0))
         val resolver = context.contentResolver
 
-        val existingNames = readDestinationNames(resolver, destinationTreeUri)
-        val manifestNames = if (mode == CopyMode.INCREMENTAL) manifest.loadAll() else emptySet()
-        Log.i(TAG, "[direct] mode=$mode existingNames=${existingNames.size} manifestNames=${manifestNames.size}")
+        val allManifest = manifest.loadAll()
+        val orphansCleaned = cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
+        val initialExisting = readDestinationNames(resolver, destinationTreeUri) - orphansCleaned
+        val diskRecovered = recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
+        val existingNames = initialExisting + diskRecovered
+        val manifestNames = if (mode == CopyMode.INCREMENTAL) allManifest else emptySet()
+        Log.i(TAG, "[saf] mode=$mode existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
 
         val candidates = try {
-            ptp.listFiles()
+            walkSafTree(resolver, sourceTreeUri, filter)
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
-            Log.e(TAG, "[direct] PTP listFiles failed", t)
-            send(CopyState.Failed("PTP 列表失败: ${t.message ?: t.javaClass.simpleName}"))
+            Log.e(TAG, "[saf] walk failed", t)
+            send(CopyState.Failed("SAF 列表失败: ${t.message ?: t.javaClass.simpleName}"))
             return@channelFlow
         }
 
@@ -267,7 +349,7 @@ class CopyEngine(
             }
         }
         send(CopyState.Scanning(candidates.size))
-        Log.i(TAG, "[direct] candidates=${candidates.size} toCopy=${toCopy.size} toSkip=${toSkip.size}")
+        Log.i(TAG, "[saf] candidates=${candidates.size} toCopy=${toCopy.size} toSkip=${toSkip.size}")
 
         if (toCopy.isEmpty()) {
             send(CopyState.Done(
@@ -308,247 +390,422 @@ class CopyEngine(
                         bytesCopied = total,
                         totalBytes = grandTotalBytes,
                         bytesPerSecond = rate,
+                        phase = CopyState.Phase.COPYING,
+                        pendingPostProcess = 0,
                     ))
                 }
             } catch (_: CancellationException) {}
         }
 
         val session = manifest.openAppendSession()
+        val batch = manifest.openBatchSession()
         val destDir = DocumentsContract.buildDocumentUriUsingTree(
             destinationTreeUri,
             DocumentsContract.getTreeDocumentId(destinationTreeUri),
         )
-
-        // Pipeline: producer (this coroutine) does sequential PTP transfers and
-        // hands the destination off to an enricher coroutine. EXIF parse + mtime +
-        // MediaStore DATE_TAKEN can take 100-500 ms per NEF — running them on the
-        // PTP critical path serialises them with USB transfers, leaving the camera
-        // idle. With a dedicated consumer, the next file's PTP transfer overlaps
-        // with the previous file's enrichment.
         val mediaStoreRelPath = mediaStoreRelativePath(destinationTreeUri)
-        Log.i(TAG, "[direct] destination MediaStore relPath=$mediaStoreRelPath")
+        Log.i(TAG, "[saf] destination MediaStore relPath=$mediaStoreRelPath")
 
-        val enrichQueue = Channel<EnrichTask>(capacity = Channel.UNLIMITED)
-        val enricherJob = launch(Dispatchers.IO) {
-            for (task in enrichQueue) {
-                try {
-                    enrichDestination(resolver, task.src, task.dstUri, task.isMediaStore)
-                    if (task.isMediaStore) {
-                        runCatching {
-                            val v = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-                            resolver.update(task.dstUri, v, null, null)
-                        }
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "enrich failed for ${task.src.name}: ${t.message}")
-                }
-            }
-        }
+        var filesCopied = 0
+        val failedFiles = mutableListOf<SafFile>()
 
         try {
-            for ((idx, mtpFile) in toCopy.withIndex()) {
+            for ((idx, srcFile) in toCopy.withIndex()) {
                 currentIndex.set(idx + 1)
-                currentName.set(mtpFile.name)
+                currentName.set(srcFile.name)
                 perFileBytes.set(0)
 
-                val mime = guessMime(mtpFile.name)
+                val mime = guessMime(srcFile.name)
                 val (newDoc, isMediaStore) = try {
-                    createDestinationUri(resolver, destDir, mediaStoreRelPath, mtpFile.name, mime)
-                } catch (ce: CancellationException) {
-                    throw ce
+                    createDestinationUri(resolver, destDir, mediaStoreRelPath, srcFile.name, mime)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "[direct] createDocument failed for ${mtpFile.name}", t)
-                    enrichQueue.close()
-                    enricherJob.join()
-                    emitterJob.cancelAndJoin()
-                    send(CopyState.Failed("创建文件失败 (${mtpFile.name}): ${t.message}"))
-                    return@channelFlow
+                    Log.e(TAG, "[saf] createDocument failed for ${srcFile.name}: ${t.message}")
+                    failedFiles += srcFile
+                    continue
                 }
 
                 val fileStartNanos = System.nanoTime()
-                val copiedBytes = try {
+                val copied = try {
                     withContext(Dispatchers.IO) {
-                        copyOneViaPtp(ptp, mtpFile, newDoc) { bytes ->
-                            perFileBytes.set(bytes)
-                        }
+                        copyOneViaSaf(resolver, srcFile, newDoc) { bytes -> perFileBytes.set(bytes) }
                     }
                 } catch (ce: CancellationException) {
-                    throw ce
-                } catch (t: Throwable) {
-                    Log.e(TAG, "[direct] PTP copy failed for ${mtpFile.name}", t)
                     runCatching {
                         if (isMediaStore) resolver.delete(newDoc, null, null)
                         else DocumentsContract.deleteDocument(resolver, newDoc)
                     }
-                    enrichQueue.close()
-                    enricherJob.join()
-                    emitterJob.cancelAndJoin()
-                    send(CopyState.Failed("PTP 拷贝失败 (${mtpFile.name}): ${t.message}"))
-                    return@channelFlow
+                    throw ce
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[saf] copy failed for ${srcFile.name}: ${t.message}")
+                    runCatching {
+                        if (isMediaStore) resolver.delete(newDoc, null, null)
+                        else DocumentsContract.deleteDocument(resolver, newDoc)
+                    }
+                    failedFiles += srcFile
+                    continue
                 }
                 val fileMs = (System.nanoTime() - fileStartNanos) / 1_000_000L
-                val fileMBs = if (fileMs > 0) copiedBytes / 1024.0 / 1024.0 / (fileMs / 1000.0) else 0.0
-                Log.i(TAG, "[direct] PTP ${mtpFile.name} ${copiedBytes}B in ${fileMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf]"}".format(fileMBs))
+                val fileMBs = if (fileMs > 0) copied / 1024.0 / 1024.0 / (fileMs / 1000.0) else 0.0
+                Log.i(TAG, "[saf] ${srcFile.name} ${copied}B in ${fileMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf-dst]"}".format(fileMBs))
 
-                priorTotalBytes.addAndGet(copiedBytes)
+                priorTotalBytes.addAndGet(copied)
                 perFileBytes.set(0)
 
-                // Mark as successfully copied IMMEDIATELY (file is on disk; manifest
-                // tracks PTP success, not enrichment). Then hand off enrichment to
-                // the consumer; producer can start next PTP transfer right away.
-                session.add(mtpFile.name)
-                val pseudoSrc = SourceFile(
-                    docUri = Uri.EMPTY,
-                    name = mtpFile.name,
-                    size = mtpFile.size,
-                    lastModified = mtpFile.dateModifiedMillis,
-                    mimeType = mime,
-                )
-                enrichQueue.send(EnrichTask(pseudoSrc, newDoc, isMediaStore))
+                session.add(srcFile.name)
+                batch.add(srcFile.name, isMediaStore, newDoc)
+                filesCopied++
             }
         } finally {
-            // Stop accepting new tasks; wait for in-flight enrichments to drain so
-            // DATE_TAKEN/mtime are written before we tell the user "done".
-            enrichQueue.close()
-            try { enricherJob.join() } catch (_: Throwable) {}
             session.close()
+            batch.close()
             emitterJob.cancelAndJoin()
         }
 
         val elapsed = (System.nanoTime() - startNanos) / 1_000_000L
         val totalBytes = priorTotalBytes.get()
         val avgMBs = if (elapsed > 0) totalBytes / 1024.0 / 1024.0 / (elapsed / 1000.0) else 0.0
-        Log.i(TAG, "[direct] Done: ${toCopy.size} files, $totalBytes B in ${elapsed}ms = %.1f MB/s avg".format(avgMBs))
+        Log.i(TAG, "[saf] Done: copied=$filesCopied failed=${failedFiles.size} skipped=${toSkip.size} $totalBytes B in ${elapsed}ms = %.1f MB/s avg".format(avgMBs))
 
         send(CopyState.Done(
-            filesCopied = toCopy.size,
+            filesCopied = filesCopied,
             filesSkipped = toSkip.size,
             totalBytes = totalBytes,
             elapsedMillis = elapsed,
         ))
     }.flowOn(Dispatchers.IO)
 
-    private fun copyOneViaPtp(
-        ptp: PtpClient,
-        file: MtpFile,
-        dstUri: Uri,
-        onProgress: (Long) -> Unit,
-    ): Long {
-        val pfd = context.contentResolver.openFileDescriptor(dstUri, "w")
-            ?: throw IOException("openDst null: ${file.name}")
-        return pfd.use { p ->
-            FileOutputStream(p.fileDescriptor).use { fos ->
-                ptp.copyObjectTo(file.handle, file.size, fos, onProgress)
-                fos.flush()
-            }
-            file.size  // PTP container length matches; could read .size from copyObjectTo's dataLen
-        }
-    }
-
     /**
-     * Use [FileUtils.copy] for the actual transfer — Android's implementation calls
-     * splice(2) when the source is a regular fd (zero-copy in kernel) and falls back
-     * to a tuned read/write loop. Returns total bytes copied.
-     *
-     * The progress listener fires at internal checkpoints (typically every 64 KiB
-     * for the read/write fallback). Listener is invoked inline on the calling thread
-     * since we pass null Executor — it just updates an AtomicLong.
+     * Recursively walk a SAF tree, returning every file accepted by [filter].
+     * Skips Android system / hidden / trash directories at every level so we
+     * don't waste time enumerating thousands of irrelevant entries on a USB SSD.
      */
-    private fun copyOneViaFileUtils(
+    private fun walkSafTree(
         resolver: ContentResolver,
-        srcUri: Uri,
-        dstUri: Uri,
-        fileName: String,
-        onProgress: (Long) -> Unit,
-    ): Long {
-        val srcPfd = resolver.openFileDescriptor(srcUri, "r")
-            ?: throw IOException("openSrc null: $fileName")
-        return srcPfd.use { src ->
-            val dstPfd = resolver.openFileDescriptor(dstUri, "w")
-                ?: throw IOException("openDst null: $fileName")
-            dstPfd.use { dst ->
-                FileUtils.copy(
-                    src.fileDescriptor,
-                    dst.fileDescriptor,
-                    null, // CancellationSignal — we rely on coroutine cancellation
-                    null, // Executor — listener fires inline (we just update an atomic)
-                ) { progress -> onProgress(progress) }
-            }
-        }
-    }
-
-    /**
-     * Three-step post-copy enrichment so gallery apps sort by capture time:
-     *
-     *  1. Pull EXIF DateTimeOriginal from the destination file. androidx.exifinterface
-     *     handles NEF (TIFF-based RAW) which the system MediaScanner can't parse.
-     *  2. Set destination mtime to that time via MtimeUtil — covers gallery apps that
-     *     fall back to file mtime when DATE_TAKEN is missing.
-     *  3. Trigger MediaScanner; on its callback, write DATE_TAKEN into MediaStore via
-     *     ContentResolver.update(). For JPG this is redundant (MediaScanner already
-     *     extracted it); for NEF this is the *primary* mechanism that makes Xiaomi
-     *     Gallery's "by capture time" sort work.
-     */
-    private fun enrichDestination(
-        resolver: ContentResolver,
-        src: SourceFile,
-        dstUri: Uri,
-        isMediaStore: Boolean,
-    ) {
-        val ext = src.name.substringAfterLast('.', "").lowercase()
-
-        val tExifStart = System.nanoTime()
-        val captureMillis = if (ext in EXIF_EXTS) {
-            val exifMs = extractExifCaptureMillis(resolver, dstUri)
-            if (exifMs > 0) exifMs else src.lastModified
-        } else {
-            src.lastModified
-        }
-        val tExifMs = (System.nanoTime() - tExifStart) / 1_000_000L
-
-        val tMtimeStart = System.nanoTime()
-        val mtimeOk = if (captureMillis > 0) MtimeUtil.setMtime(resolver, dstUri, captureMillis) else false
-        val tMtimeMs = (System.nanoTime() - tMtimeStart) / 1_000_000L
-
-        Log.i(TAG, "enrich ${src.name}: capture=$captureMillis exifT=${tExifMs}ms mtimeOK=$mtimeOk mtimeT=${tMtimeMs}ms isMediaStore=$isMediaStore")
-
-        if (captureMillis <= 0) return
-
-        if (isMediaStore) {
-            // We own this row (we did the insert); update DATE_TAKEN directly.
-            // No SecurityException risk, no MediaScanner round-trip needed.
-            updateAndVerifyDateTaken(resolver, dstUri, captureMillis, src.name, scanT = 0)
-            return
-        }
-
-        // SAF-created file: we don't own its MediaStore row. Best-effort: trigger
-        // a scan and try to update on the resulting row (will throw SecurityException
-        // on Android 11+ if we're not the owner, but JPG works anyway because
-        // MediaScanner extracts DATE_TAKEN from JPG EXIF natively).
-        val docId = try { DocumentsContract.getDocumentId(dstUri) } catch (_: Throwable) { return }
-        if (!docId.startsWith("primary:")) return
-        val path = "/storage/emulated/0/" + docId.removePrefix("primary:")
-
-        try {
-            val tScanStart = System.nanoTime()
-            MediaScannerConnection.scanFile(context, arrayOf(path), null) { _, scannedUri ->
-                val tScanMs = (System.nanoTime() - tScanStart) / 1_000_000L
-                val mediaUri = scannedUri ?: queryMediaUriByPath(resolver, path)
-                if (mediaUri == null) {
-                    Log.w(TAG, "no MediaStore URI for ${src.name} (scanT=${tScanMs}ms)")
-                    return@scanFile
+        treeUri: Uri,
+        filter: CopyFilter,
+    ): List<SafFile> {
+        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val out = ArrayList<SafFile>()
+        val queue: ArrayDeque<Pair<String, String>> = ArrayDeque()
+        queue.addLast(rootDocId to "")
+        while (queue.isNotEmpty()) {
+            val (docId, path) = queue.removeFirst()
+            for (entry in listSafEntries(resolver, treeUri, docId)) {
+                if (entry.isDir) {
+                    if (entry.name.startsWith(".")) continue
+                    if (entry.name in SAF_SKIP_DIRS) continue
+                    val nextPath = if (path.isEmpty()) entry.name else "$path/${entry.name}"
+                    queue.addLast(entry.documentId to nextPath)
+                } else {
+                    val ext = entry.name.substringAfterLast('.', "").lowercase()
+                    if (ext.isBlank()) continue
+                    if (!filter.accepts(path, ext)) continue
+                    out += SafFile(
+                        docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, entry.documentId),
+                        name = entry.name,
+                        size = entry.size,
+                        lastModified = entry.lastModified,
+                        parentPath = path,
+                        extension = ext,
+                    )
                 }
-                val ok = updateAndVerifyDateTaken(resolver, mediaUri, captureMillis, src.name, scanT = tScanMs)
-                if (!ok) {
-                    val byPath = queryMediaUriByPath(resolver, path)
-                    if (byPath != null && byPath != mediaUri) {
-                        updateAndVerifyDateTaken(resolver, byPath, captureMillis, src.name, scanT = tScanMs)
-                    }
+            }
+        }
+        return out
+    }
+
+    private data class SafEntry(
+        val documentId: String,
+        val name: String,
+        val size: Long,
+        val lastModified: Long,
+        val isDir: Boolean,
+    )
+
+    private fun listSafEntries(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        parentDocId: String,
+    ): List<SafEntry> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val proj = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+        val out = ArrayList<SafEntry>()
+        try {
+            resolver.query(childrenUri, proj, null, null, null)?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val mtimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                while (c.moveToNext()) {
+                    val mime = c.getString(mimeCol)
+                    val name = c.getString(nameCol) ?: continue
+                    out += SafEntry(
+                        documentId = c.getString(idCol),
+                        name = name,
+                        size = if (sizeCol >= 0 && !c.isNull(sizeCol)) c.getLong(sizeCol) else 0L,
+                        lastModified = if (mtimeCol >= 0 && !c.isNull(mtimeCol)) c.getLong(mtimeCol) else 0L,
+                        isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR,
+                    )
                 }
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "media scan failed for ${src.name}: ${t.message}")
+            Log.w(TAG, "listSafEntries($parentDocId) failed: ${t.message}")
         }
+        return out
+    }
+
+    /**
+     * Stream-copy a SAF source file's bytes to [dstUri]. Uses [android.os.FileUtils.copy]
+     * which dispatches to splice(2)/sendfile(2) when both descriptors are seekable
+     * (typical for SAF-on-storage), falling back to a buffered read/write loop.
+     */
+    private fun copyOneViaSaf(
+        resolver: ContentResolver,
+        src: SafFile,
+        dstUri: Uri,
+        onProgress: (Long) -> Unit,
+    ): Long {
+        val srcPfd = resolver.openFileDescriptor(src.docUri, "r")
+            ?: throw IOException("openSrc null: ${src.name}")
+        return srcPfd.use { sp ->
+            val dstPfd = resolver.openFileDescriptor(dstUri, "w")
+                ?: throw IOException("openDst null: ${src.name}")
+            dstPfd.use { dp ->
+                val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+                try {
+                    android.os.FileUtils.copy(
+                        sp.fileDescriptor,
+                        dp.fileDescriptor,
+                        null, // CancellationSignal — coroutine cancellation handles it
+                        executor,
+                        android.os.FileUtils.ProgressListener { progress -> onProgress(progress) },
+                    )
+                } finally {
+                    executor.shutdown()
+                }
+            }
+        }
+    }
+
+    /** Always-skip directory names when walking a SAF source for copy. */
+    private val SAF_SKIP_DIRS = setOf(
+        "Android", "LOST.DIR", "System Volume Information",
+        "\$RECYCLE.BIN", "RECYCLER",
+        ".Trash", ".Trashes", ".Spotlight-V100", ".fseventsd",
+        ".TemporaryItems", ".thumbnails",
+    )
+
+    // ----------------------------------------------------------------- fix dates
+
+    /**
+     * High-parallelism date-fixing flow. Uses the last-batch manifest (recorded
+     * at copy time) so we update exactly the files from the most recent copy
+     * session — and we use the stored MediaStore URIs directly to avoid the
+     * flaky queryMediaUriByPath lookup that was failing for some NEFs.
+     */
+    fun fixDatesFlow(
+        destinationTreeUri: Uri,
+        parallelism: Int = 6,
+    ): Flow<CopyState> = channelFlow {
+        send(CopyState.Scanning(0))
+        val resolver = context.contentResolver
+
+        val batch = manifest.loadLastBatch()
+        Log.i(TAG, "[fixDates] loaded last batch: ${batch.size} files")
+        send(CopyState.Scanning(batch.size))
+
+        if (batch.isEmpty()) {
+            send(CopyState.Failed("没有上次拷贝批次记录，请先执行拷贝"))
+            return@channelFlow
+        }
+
+        val startNanos = System.nanoTime()
+        val processed = AtomicInteger(0)
+        val fixedOk = AtomicInteger(0)
+        val alreadyFixed = AtomicInteger(0)
+        val noExif = AtomicInteger(0)
+        val failedCount = AtomicInteger(0)
+        val currentName = AtomicReference("...")
+
+        val emitterJob = launch {
+            try {
+                while (isActive) {
+                    delay(200)
+                    send(CopyState.Running(
+                        currentIndex = processed.get(),
+                        totalFiles = batch.size,
+                        currentName = currentName.get(),
+                        bytesCopied = 0,
+                        totalBytes = 0,
+                        bytesPerSecond = 0,
+                        phase = CopyState.Phase.FIXING_DATES,
+                        pendingPostProcess = batch.size - processed.get(),
+                    ))
+                }
+            } catch (_: CancellationException) {}
+        }
+
+        val queue = Channel<ManifestStore.BatchEntry>(capacity = Channel.UNLIMITED)
+        launch { for (e in batch) queue.send(e); queue.close() }
+
+        val workers = (1..parallelism).map {
+            launch(Dispatchers.IO) {
+                for (entry in queue) {
+                    currentName.set(entry.name)
+                    val outcome = try {
+                        fixOneDateEntry(resolver, entry)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "[fixDates] threw for ${entry.name}: ${t.javaClass.simpleName}: ${t.message}")
+                        FixOutcome.FAILED
+                    }
+                    when (outcome) {
+                        FixOutcome.FIXED -> fixedOk.incrementAndGet()
+                        FixOutcome.ALREADY_FIXED -> alreadyFixed.incrementAndGet()
+                        FixOutcome.NO_EXIF -> noExif.incrementAndGet()
+                        FixOutcome.FAILED -> failedCount.incrementAndGet()
+                    }
+                    processed.incrementAndGet()
+                }
+            }
+        }
+        workers.forEach { it.join() }
+        emitterJob.cancelAndJoin()
+
+        val elapsed = (System.nanoTime() - startNanos) / 1_000_000L
+        val fixed = fixedOk.get()
+        val alreadyOk = alreadyFixed.get()
+        val noExifN = noExif.get()
+        val failed = failedCount.get()
+        Log.i(TAG, "[fixDates] Done: fixed=$fixed already=$alreadyOk no-exif=$noExifN failed=$failed total=${batch.size} in ${elapsed}ms")
+
+        // Success semantics: fixed + already-fixed both count as "successfully handled".
+        // Only no-exif and failed are reported as skipped.
+        send(CopyState.Done(
+            filesCopied = fixed + alreadyOk,
+            filesSkipped = noExifN + failed,
+            totalBytes = 0,
+            elapsedMillis = elapsed,
+        ))
+    }.flowOn(Dispatchers.IO)
+
+    /** Result of one date-fix attempt — used for end-of-batch reporting. */
+    private enum class FixOutcome { FIXED, ALREADY_FIXED, NO_EXIF, FAILED }
+
+    /**
+     * Fix mtime + DATE_TAKEN for a single batch entry.
+     *
+     * CRITICAL SAFETY: We never toggle IS_PENDING on an already-published file.
+     * Re-publishing a published file (via IS_PENDING=1→0) causes MediaProvider
+     * to rename the underlying file to `.pending-<timestamp>-<name>` on disk.
+     * If the subsequent update(IS_PENDING=0) fails or the row is GC'd, the
+     * file becomes a permanent orphan with the `.pending-*` prefix — this is
+     * what caused mass file loss on repeated fix-dates clicks.
+     *
+     * New contract:
+     *   - If DATE_TAKEN already matches captureMillis → ALREADY_FIXED, do nothing
+     *   - If IS_PENDING=1 (first-time publish after copy) → publish with DATE_TAKEN
+     *   - If IS_PENDING=0 (already published) → just update DATE_TAKEN, no toggle
+     */
+    private fun fixOneDateEntry(
+        resolver: ContentResolver,
+        entry: ManifestStore.BatchEntry,
+    ): FixOutcome {
+        val name = entry.name
+        val ext = name.substringAfterLast('.', "").lowercase()
+
+        val captureMillis = if (ext in EXIF_EXTS) {
+            extractExifCaptureMillis(resolver, entry.uri)
+        } else 0L
+
+        if (captureMillis <= 0) {
+            Log.w(TAG, "[fixDates] no EXIF capture time for $name uri=${entry.uri}")
+            return FixOutcome.NO_EXIF
+        }
+
+        // Short-circuit: if DATE_TAKEN is already correct, skip ALL operations.
+        // This prevents any MediaStore toggling on re-runs.
+        if (entry.isMediaStore) {
+            val currentDateTaken = readMediaLong(resolver, entry.uri, MediaStore.MediaColumns.DATE_TAKEN)
+            if (currentDateTaken == captureMillis) {
+                Log.i(TAG, "[fixDates] $name already fixed (DATE_TAKEN=$currentDateTaken) — skipping")
+                return FixOutcome.ALREADY_FIXED
+            }
+        }
+
+        // Set file mtime via JNI futimens (safe — operates only on fd)
+        val mtimeOk = MtimeUtil.setMtime(resolver, entry.uri, captureMillis)
+        if (!mtimeOk) Log.w(TAG, "[fixDates] mtime set failed for $name")
+
+        val dateTakenOk: Boolean = if (entry.isMediaStore) {
+            updateDateTakenSafely(resolver, entry.uri, captureMillis, name)
+        } else {
+            // SAF-created: best-effort via path lookup
+            val docId = try { DocumentsContract.getDocumentId(entry.uri) } catch (_: Throwable) { null }
+            val path = if (docId != null && docId.startsWith("primary:"))
+                "/storage/emulated/0/" + docId.removePrefix("primary:")
+            else null
+            if (path != null) {
+                val mu = queryMediaUriByPath(resolver, path)
+                if (mu != null) updateDateTakenSafely(resolver, mu, captureMillis, name)
+                else { Log.w(TAG, "[fixDates] no MediaStore row for SAF file $name"); false }
+            } else false
+        }
+
+        Log.i(TAG, "[fixDates] $name capture=$captureMillis mtime=$mtimeOk dateTaken=$dateTakenOk")
+        return if (mtimeOk && dateTakenOk) FixOutcome.FIXED else FixOutcome.FAILED
+    }
+
+    /**
+     * Safely update DATE_TAKEN on a MediaStore URI.
+     *
+     * If the file is currently IS_PENDING=1 (just copied, awaiting first publish):
+     *   - Write DATE_TAKEN + flip IS_PENDING=0 in one update. This is the ideal
+     *     path: Xiaomi Gallery first sees the file WITH the correct DATE_TAKEN.
+     *
+     * If the file is already IS_PENDING=0 (published):
+     *   - Just update DATE_TAKEN. NO toggle. Xiaomi Gallery's cache may stay
+     *     stale but we won't risk file loss from repeated toggling.
+     */
+    private fun updateDateTakenSafely(
+        resolver: ContentResolver,
+        mediaUri: Uri,
+        captureMillis: Long,
+        name: String,
+    ): Boolean {
+        val currentPending = readMediaLong(resolver, mediaUri, MediaStore.MediaColumns.IS_PENDING)
+        val isPending = currentPending == 1L
+        Log.i(TAG, "[fixDates] $name currentPending=$currentPending → ${if (isPending) "first-publish" else "in-place update"}")
+
+        repeat(3) { attempt ->
+            try {
+                val v = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DATE_TAKEN, captureMillis)
+                    put(MediaStore.MediaColumns.DATE_MODIFIED, captureMillis / 1000)
+                    if (isPending) put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                resolver.update(mediaUri, v, null, null)
+            } catch (t: Throwable) {
+                Log.w(TAG, "[fixDates] update threw for $name: ${t.message}")
+            }
+            val readBack = readMediaLong(resolver, mediaUri, MediaStore.MediaColumns.DATE_TAKEN)
+            if (readBack == captureMillis) {
+                runCatching { resolver.notifyChange(mediaUri, null) }
+                Log.i(TAG, "[fixDates] DATE_TAKEN=$captureMillis verified for $name (attempt=${attempt + 1})")
+                return true
+            }
+            Log.w(TAG, "[fixDates] DATE_TAKEN drift for $name: read=$readBack expected=$captureMillis (attempt=${attempt + 1})")
+            try { Thread.sleep(200L * (attempt + 1)) } catch (_: Throwable) {}
+        }
+        return false
     }
 
     /**
@@ -606,41 +863,19 @@ class CopyEngine(
         return uri to false
     }
 
-    /**
-     * Write DATE_TAKEN + DATE_MODIFIED to a MediaStore row and immediately re-read
-     * to verify persistence. Some providers (especially for less-common MIME types)
-     * silently drop updates; the read-back tells us so we can try the other URI.
-     */
-    private fun updateAndVerifyDateTaken(
+    private fun readMediaLong(
         resolver: ContentResolver,
         mediaUri: Uri,
-        captureMillis: Long,
-        name: String,
-        scanT: Long,
-    ): Boolean {
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DATE_TAKEN, captureMillis)
-            put(MediaStore.MediaColumns.DATE_MODIFIED, captureMillis / 1000)
-        }
-        val rows = try {
-            resolver.update(mediaUri, values, null, null)
-        } catch (t: Throwable) {
-            Log.w(TAG, "DATE_TAKEN update threw for $name uri=$mediaUri: ${t.javaClass.simpleName}: ${t.message}")
-            return false
-        }
-        // Read back to see what actually persisted.
-        val readBack = try {
-            resolver.query(mediaUri, arrayOf(MediaStore.MediaColumns.DATE_TAKEN), null, null, null)?.use { c ->
+        column: String,
+    ): Long {
+        return try {
+            resolver.query(mediaUri, arrayOf(column), null, null, null)?.use { c ->
                 if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
             } ?: -1L
         } catch (t: Throwable) {
-            Log.w(TAG, "DATE_TAKEN readback threw: ${t.message}")
+            Log.w(TAG, "media readback for $column threw: ${t.message}")
             -2L
         }
-        val verified = readBack == captureMillis
-        Log.i(TAG, "DATE_TAKEN $name uri=$mediaUri rows=$rows scanT=${scanT}ms wrote=$captureMillis read=$readBack verify=${if (verified) "OK" else "FAIL"}")
-        runCatching { resolver.notifyChange(mediaUri, null) }
-        return verified
     }
 
     /**
@@ -700,116 +935,218 @@ class CopyEngine(
         }
     }
 
-    private fun walkTree(
+    /**
+     * Self-repair step for on-disk `.pending-<timestamp>-<name>` files whose
+     * MediaStore row was GC'd by the system (e.g. after an app crash or OOM
+     * mid-copy). These files can't be fixed via MediaStore API since the row
+     * no longer exists. We rename them via SAF back to their original name
+     * so the next copy attempt can either skip them (if whole) or overwrite.
+     *
+     * Safety: skip if the original name already exists in [currentNames]
+     * (avoid collision with legitimately-tracked pending files).
+     */
+    private fun recoverDiskPendingOrphans(
         resolver: ContentResolver,
         treeUri: Uri,
-        onFile: (SourceFile) -> Unit,
-    ) {
-        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-        val stack = ArrayDeque<String>()
-        stack.addLast(rootDocId)
-
-        while (stack.isNotEmpty()) {
-            val parentId = stack.removeLast()
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
-            queryChildren(resolver, treeUri, childrenUri) { entry ->
-                if (entry.isDir) {
-                    stack.addLast(entry.documentId)
-                } else {
-                    onFile(
-                        SourceFile(
-                            docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, entry.documentId),
-                            name = entry.name,
-                            size = entry.size,
-                            lastModified = entry.lastModified,
-                            mimeType = entry.mimeType,
-                        )
-                    )
+        currentNames: Set<String>,
+    ): Set<String> {
+        val recovered = mutableSetOf<String>()
+        val pendingRegex = Regex("""^\.pending-\d+-(.+)$""")
+        try {
+            val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootId)
+            val candidates = mutableListOf<Pair<String, String>>() // docId -> origName
+            resolver.query(
+                children,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                ),
+                null, null, null,
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                while (c.moveToNext()) {
+                    val name = c.getString(nameCol) ?: continue
+                    val m = pendingRegex.matchEntire(name) ?: continue
+                    val origName = m.groupValues[1]
+                    if (origName in currentNames) continue  // collision risk, skip
+                    candidates += c.getString(idCol) to origName
                 }
             }
-        }
-    }
-
-    private data class Entry(
-        val documentId: String,
-        val name: String,
-        val size: Long,
-        val lastModified: Long,
-        val mimeType: String?,
-        val isDir: Boolean,
-    )
-
-    private fun queryChildren(
-        resolver: ContentResolver,
-        @Suppress("UNUSED_PARAMETER") treeUri: Uri,
-        childrenUri: Uri,
-        block: (Entry) -> Unit,
-    ) {
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-        )
-        var cursor: Cursor? = null
-        try {
-            cursor = resolver.query(childrenUri, projection, null, null, null)
-            if (cursor == null) return
-            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-            val sizeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-            val mtimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-            while (cursor.moveToNext()) {
-                val mime = cursor.getString(mimeCol)
-                val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                block(
-                    Entry(
-                        documentId = cursor.getString(idCol),
-                        name = cursor.getString(nameCol) ?: "(unnamed)",
-                        size = if (sizeCol >= 0 && !cursor.isNull(sizeCol)) cursor.getLong(sizeCol) else 0L,
-                        lastModified = if (mtimeCol >= 0 && !cursor.isNull(mtimeCol)) cursor.getLong(mtimeCol) else 0L,
-                        mimeType = mime,
-                        isDir = isDir,
-                    )
-                )
+            for ((docId, origName) in candidates) {
+                val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                try {
+                    val newUri = DocumentsContract.renameDocument(resolver, docUri, origName)
+                    if (newUri != null) {
+                        recovered += origName
+                        Log.i(TAG, "recoverDiskPending: renamed stuck pending → $origName")
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "recoverDiskPending: rename $origName failed: ${t.message}")
+                }
             }
-        } finally {
-            cursor?.close()
+        } catch (t: Throwable) {
+            Log.w(TAG, "recoverDiskPendingOrphans failed: ${t.message}")
         }
+        if (recovered.isNotEmpty()) {
+            Log.i(TAG, "recoverDiskPending: recovered ${recovered.size} stuck files")
+        }
+        return recovered
     }
 
+    /**
+     * Detect and delete orphan IS_PENDING=1 files owned by our app in the
+     * destination. These are leftovers from cancelled copy sessions — the
+     * MediaStore row was created but the transfer never completed.
+     *
+     * Protection: files whose names appear in [allManifestNames] are LEGITIMATE
+     * pending-awaiting-fix-dates files from the previous completed copy.
+     * Those are preserved.
+     *
+     * Returns the set of names we deleted (so callers can exclude them from
+     * existingNames and re-copy).
+     */
+    private fun cleanupOrphanPending(
+        resolver: ContentResolver,
+        destinationTreeUri: Uri,
+        allManifestNames: Set<String>,
+    ): Set<String> {
+        val mediaStoreRelPath = mediaStoreRelativePath(destinationTreeUri) ?: return emptySet()
+        val removed = mutableSetOf<String>()
+        val collections = listOf(
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        )
+        val projection = arrayOf(
+            MediaStore.MediaColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+        )
+        val selection = "${MediaStore.MediaColumns.IS_PENDING}=1 AND " +
+            "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND " +
+            "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+        val selectionArgs = arrayOf(context.packageName, mediaStoreRelPath)
+
+        val queryBundle = Bundle().apply {
+            putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+            putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
+            putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+        }
+
+        for (collection in collections) {
+            try {
+                resolver.query(collection, projection, queryBundle, null)?.use { c ->
+                    val idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                    while (c.moveToNext()) {
+                        val id = c.getLong(idCol)
+                        val name = c.getString(nameCol) ?: continue
+                        if (name in allManifestNames) continue  // legitimate, skip
+                        val uri = ContentUris.withAppendedId(collection, id)
+                        try {
+                            val rows = resolver.delete(uri, null, null)
+                            if (rows > 0) {
+                                removed += name
+                                Log.i(TAG, "cleanupOrphan: deleted partial $name (id=$id)")
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "cleanupOrphan: delete $name failed: ${t.message}")
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "cleanupOrphan query failed: ${t.message}")
+            }
+        }
+        if (removed.isNotEmpty()) {
+            Log.i(TAG, "cleanupOrphan: removed ${removed.size} orphans")
+        }
+        return removed
+    }
+
+    /**
+     * Enumerate destination file names to suppress duplicate copies.
+     *
+     * CRITICAL: When a MediaStore row has IS_PENDING=1, MediaProvider
+     * renames the underlying file on disk to `.pending-<timestamp>-<name>`.
+     * A pure SAF tree query (backed by ExternalStorageProvider → raw
+     * filesystem) returns the `.pending-*` disk names, NOT the original
+     * DISPLAY_NAMEs. This caused ALL-mode to re-copy every pending file
+     * on repeated runs (since `NZF_4393.NEF` wasn't in existingNames —
+     * only `.pending-TIMESTAMP-NZF_4393.NEF` was).
+     *
+     * Fix: also query MediaStore by RELATIVE_PATH (including pending
+     * rows) to get the true DISPLAY_NAMEs. The union covers both
+     * SAF-created files (non-MediaStore) and pending MediaStore files.
+     */
     private fun readDestinationNames(resolver: ContentResolver, treeUri: Uri): Set<String> {
-        val rootId = DocumentsContract.getTreeDocumentId(treeUri)
-        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootId)
         val names = HashSet<String>()
-        var c: Cursor? = null
+
+        // 1) SAF tree query — disk filenames (may include .pending-* for our own pending files
+        //    and original names for everything else including SAF-created non-MediaStore files)
         try {
-            c = resolver.query(
+            val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootId)
+            resolver.query(
                 children,
                 arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
-                null, null, null
-            )
-            if (c != null) {
+                null, null, null,
+            )?.use { c ->
                 val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 while (c.moveToNext()) {
                     names += c.getString(nameCol) ?: continue
                 }
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "无法读取目标目录列表，跳过去重: ${t.message}")
-        } finally {
-            c?.close()
+            Log.w(TAG, "无法读取保存目录列表 (SAF)：${t.message}")
         }
+
+        // 2) MediaStore RELATIVE_PATH query — DISPLAY_NAMEs of all our rows
+        //    including IS_PENDING=1. This is what makes the ALL-mode skip
+        //    logic correct for files in MediaProvider's `.pending-*` disk state.
+        val relPath = mediaStoreRelativePath(treeUri)
+        if (relPath != null) {
+            val collections = listOf(
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            )
+            val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME)
+            val selection = "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+            val queryBundle = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(relPath))
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+            }
+            for (collection in collections) {
+                try {
+                    resolver.query(collection, projection, queryBundle, null)?.use { c ->
+                        val col = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                        while (c.moveToNext()) {
+                            names += c.getString(col) ?: continue
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "MediaStore DISPLAY_NAME 查询失败: ${t.message}")
+                }
+            }
+        }
+
         return names
     }
 
     private fun guessMime(name: String): String =
         when (name.substringAfterLast('.', "").lowercase()) {
             "nef" -> "image/x-nikon-nef"
+            "arw" -> "image/x-sony-arw"
+            "cr2" -> "image/x-canon-cr2"
+            "cr3" -> "image/x-canon-cr3"
+            "raf" -> "image/x-fuji-raf"
+            "rw2" -> "image/x-panasonic-rw2"
+            "dng" -> "image/x-adobe-dng"
             "jpg", "jpeg" -> "image/jpeg"
+            "heif", "heic", "hif" -> "image/heif"
             "mp4" -> "video/mp4"
+            "mov" -> "video/quicktime"
             else -> "application/octet-stream"
         }
 }
@@ -876,6 +1213,23 @@ private object MtimeUtil {
 
     fun setMtime(resolver: ContentResolver, uri: Uri, epochMillis: Long): Boolean {
         if (epochMillis <= 0) return false
+
+        // --- Path 1: JNI futimens (works on any Android, no hidden API) ---
+        if (NativeMtime.available) {
+            try {
+                val pfd = resolver.openFileDescriptor(uri, "rw")
+                    ?: resolver.openFileDescriptor(uri, "r")
+                if (pfd != null) {
+                    val ok = pfd.use { NativeMtime.setMtimeByFd(it.fd, epochMillis) }
+                    Log.i(TAG, "setMtime JNI ${if (ok) "VERIFIED" else "MISMATCH"}: target=${epochMillis / 1000}s uri=$uri")
+                    if (ok) return true
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "setMtime JNI failed: ${t.message}")
+            }
+        }
+
+        // --- Path 2: reflection fallback (older Androids where hidden API works) ---
         ensureInit()
         val method = utimensatMethod ?: run {
             Log.w(TAG, "setMtime: utimensat method unavailable (init failed)")
@@ -899,14 +1253,11 @@ private object MtimeUtil {
                 }
             pfd.use {
                 method.invoke(null, /* AT_FDCWD = */ -100, "/proc/self/fd/${it.fd}", arr, 0)
-                // Verify by reading mtime back via the public Os.fstat API. If the
-                // syscall silently failed (e.g. EPERM on a media_rw-owned file under
-                // scoped storage), this comparison reveals it.
                 try {
                     val stat = Os.fstat(it.fileDescriptor)
                     val actualSec = stat.st_mtime
                     val ok = actualSec == sec
-                    Log.i(TAG, "setMtime ${if (ok) "VERIFIED" else "MISMATCH"}: target=${sec}s actual=${actualSec}s uri=$uri")
+                    Log.i(TAG, "setMtime reflection ${if (ok) "VERIFIED" else "MISMATCH"}: target=${sec}s actual=${actualSec}s uri=$uri")
                     return ok
                 } catch (t: Throwable) {
                     Log.w(TAG, "setMtime verify (fstat) failed: ${t.message}")
@@ -914,7 +1265,7 @@ private object MtimeUtil {
             }
             true
         } catch (t: Throwable) {
-            Log.w(TAG, "setMtime failed for $uri: ${t.javaClass.simpleName}: ${t.message}")
+            Log.w(TAG, "setMtime reflection failed for $uri: ${t.javaClass.simpleName}: ${t.message}")
             false
         }
     }

@@ -1,7 +1,9 @@
 # Build outputs
 build/
 app/build/
+app/.cxx/
 .gradle/
+.kotlin/
 
 # IDE
 .idea/
@@ -23,3 +25,11 @@ nikon_debug/
 
 # Claude Code
 .claude/
+
+# Local-only working docs
+APP_DEV_LOG.md
+AGENTS.md
+XIAOHONGSHU_DRAFT.md
+
+# Source art (Adobe Illustrator). nikoncopy.svg is the committed export.
+*.ai
