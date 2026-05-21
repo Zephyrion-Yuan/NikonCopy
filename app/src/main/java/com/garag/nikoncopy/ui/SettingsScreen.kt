@@ -248,9 +248,6 @@ fun SettingsScreen(
             )
 
             // Per-profile transient state (rescan in flight, last status text).
-            // PTP profiles only get a rescan affordance when their device is
-            // currently connected, otherwise the rescan would silently target
-            // whatever PTP camera happens to be plugged in right now.
             val rescanning = remember { mutableStateOf<Set<String>>(emptySet()) }
             val scanMsgs = remember { mutableStateOf<Map<String, String>>(emptyMap()) }
             // Per-card expansion override. Default: only the active profile
@@ -266,7 +263,10 @@ fun SettingsScreen(
                 // does come back — it isn't a connection signal.
                 val mscConnected = isMsc && profile.deviceKey in detectedKeys
                 val connected = ptpConnected || mscConnected
-                val canRescan = (isMsc && profile.sourceTreeUri != null) || ptpConnected
+                // Rescan is meaningful whenever any source path is available:
+                // - direct PTP (camera connected + 直连加速 ready), OR
+                // - SAF tree URI saved (MSC or PTP-via-system-MTP-provider).
+                val canRescan = profile.sourceTreeUri != null || ptpConnected
                 val isRescanning = profile.id in rescanning.value
                 val defaultExpanded = profile.id == activeProfile?.id
                 val expanded = expandOverride.value[profile.id] ?: defaultExpanded
@@ -287,12 +287,13 @@ fun SettingsScreen(
                         pendingProfileDestination = profile.id
                         pickDestLauncher.launch(null)
                     },
-                    onPickMscSource = if (isMsc) {
-                        {
-                            pendingMscSourceProfileId = profile.id
-                            pickMscSourceLauncher.launch(null)
-                        }
-                    } else null,
+                    // Both MSC and PTP profiles can carry a SAF source URI now:
+                    // for MSC it's the SD/U盘 root; for PTP it's the system
+                    // com.android.mtp provider tree (non-root fallback).
+                    onPickMscSource = {
+                        pendingMscSourceProfileId = profile.id
+                        pickMscSourceLauncher.launch(null)
+                    },
                     onToggleDirectory = { dir, selected ->
                         vm.setProfileDirectory(profile.id, dir, selected)
                     },
@@ -305,8 +306,11 @@ fun SettingsScreen(
                             scope.launch {
                                 rescanning.value = rescanning.value + profile.id
                                 try {
-                                    val msg = if (isMsc) vm.rescanMscProfile(profile.id)
-                                    else vm.scanConnectedCameraProfile()
+                                    // For PTP: scanConnectedCameraProfile tries direct PTP
+                                    // first and auto-falls back to SAF probe when direct is
+                                    // unavailable. For MSC: rescanSafSource directly.
+                                    val msg = if (isMsc) vm.rescanSafSource(profile.id)
+                                    else vm.scanConnectedCameraProfile(profile.id)
                                     scanMsgs.value = scanMsgs.value + (profile.id to msg)
                                 } finally {
                                     rescanning.value = rescanning.value - profile.id
@@ -342,22 +346,18 @@ fun SettingsScreen(
 
             var applyingPatch by remember { mutableStateOf(false) }
             SettingRow(
-                title = "直连加速设置",
+                title = "直连加速设置（可选）",
                 subtitle = when {
                     applyingPatch -> "正在应用…"
-                    patchStatus.fullyApplied -> "已就绪"
-                    else -> buildString {
-                        append(if (patchStatus.mtpDisabled) "MTP ✓" else "MTP ✗")
-                        append(" · ")
-                        append(if (patchStatus.hiddenApiPolicy == 1) "hidden_api ✓" else "hidden_api ✗")
-                    }
+                    patchStatus.fullyApplied -> "已就绪 · 直连模式可用"
+                    else -> "未启用 · 兼容模式（无需 root）也可用"
                 },
                 actionIcon = Icons.Outlined.Bolt,
                 actionLabel = if (patchStatus.fullyApplied) "检查状态" else "应用",
                 destructive = false,
                 info = InfoContent(
                     title = "直连加速设置",
-                    body = "可提高 USB 直连拷贝速度。\n\n如果设备已 root（Magisk/KernelSU/APatch），应用会自动设置；否则会给出 adb 命令，有能力的用户可手动执行。",
+                    body = "可选的高级选项，启用后能让 USB 直连拷贝速度从 ~14 MB/s 提到 160+ MB/s。\n\n· 不启用：照样可以拷贝（兼容模式，走系统 MTP 路径）。\n· 启用条件：设备已 root（Magisk / KernelSU / APatch）。应用会自动写入两项系统设置；无 root 也可手动执行给出的 adb 命令。\n\n普通用户可以完全忽略这一项。"
                 ),
                 onShowInfo = showInfo,
                 onAction = {
@@ -765,7 +765,7 @@ private fun CameraProfileCard(
                                     if (profile.kind == DeviceKind.MSC)
                                         "外接存储设备。识别码：${profile.deviceKey}\n更新时间：${formatTime(profile.updatedAt)}\n\n存储设备按 RAW/JPG/MP4 等已知格式做探测。可点「重新扫描」更换源目录。"
                                     else
-                                        "PTP 相机。识别码：${profile.deviceKey}\n更新时间：${formatTime(profile.updatedAt)}\n\n相机插入并授权 USB 后，「重新扫描」扫描相机所有源子目录与文件格式。",
+                                        "PTP 相机。识别码：${profile.deviceKey}\n更新时间：${formatTime(profile.updatedAt)}\n\n两种读取方式：\n· 直连模式（快，160+ MB/s）：需要设备 root + 应用了「直连加速」，应用会自动尝试\n· 兼容模式（一般，14 MB/s 左右）：无需 root，但需要你点「选择源目录」授权一次，在弹出的文件选择器中选中相机\n\n两种方式可以同时配置 —— 直连可用时优先用直连，不可用时自动回退到兼容模式。",
                                 )
                             }
                         }

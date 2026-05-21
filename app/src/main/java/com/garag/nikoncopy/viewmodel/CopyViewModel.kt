@@ -122,20 +122,21 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Re-probe an MSC profile's source tree for media. Returns a friendly status
-     * message that the UI can surface; never throws.
+     * Re-probe a profile's saved SAF source tree for media. Works for MSC
+     * (SD/U盘 root chosen via SAF) and for PTP profiles that have a
+     * `com.android.mtp` tree URI saved (non-root fallback path). Returns a
+     * friendly status message; never throws.
      */
-    suspend fun rescanMscProfile(profileId: String): String = withContext(Dispatchers.IO) {
-        android.util.Log.i("CopyViewModel", "rescanMscProfile profileId=$profileId")
+    suspend fun rescanSafSource(profileId: String): String = withContext(Dispatchers.IO) {
+        android.util.Log.i("CopyViewModel", "rescanSafSource profileId=$profileId")
         val profile = settings.cameraProfilesSnapshot().firstOrNull { it.id == profileId }
             ?: return@withContext "找不到该设备配置"
-        if (profile.kind != DeviceKind.MSC) return@withContext "只有外接存储设备才能扫描"
         val sourceUri = profile.sourceTreeUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
             ?: run {
-                android.util.Log.w("CopyViewModel", "rescanMscProfile: ${profile.id} has no sourceTreeUri")
+                android.util.Log.w("CopyViewModel", "rescanSafSource: ${profile.id} has no sourceTreeUri")
                 return@withContext "尚未选择源目录"
             }
-        android.util.Log.i("CopyViewModel", "rescanMscProfile: starting probe on $sourceUri")
+        android.util.Log.i("CopyViewModel", "rescanSafSource: starting probe on $sourceUri")
         val result = try {
             MediaProbe.probeSaf(ctx.contentResolver, sourceUri)
         } catch (t: Throwable) {
@@ -169,8 +170,11 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
         val mode = if (result.usedConventionProbe) "约定扫描" else "全量 BFS"
         val limitNote = if (result.bailedOnLimit) "（已达扫描上限）" else ""
         "$mode 完成：${result.totalMediaFiles} 个媒体文件，${detectedDirs.size} 个目录，" +
-            "${detectedExts.size} 种格式，耗时 ${result.elapsedMs / 1000.0} 秒$limitNote"
+            "${detectedExts.size} 种文件格式，耗时 ${result.elapsedMs / 1000.0} 秒$limitNote"
     }
+
+    /** Back-compat alias used elsewhere. */
+    suspend fun rescanMscProfile(profileId: String): String = rescanSafSource(profileId)
 
     init {
         viewModelScope.launch {
@@ -250,15 +254,35 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.setDestinationUri(uri.toString()) }
     }
 
-    suspend fun scanConnectedCameraProfile(): String = withContext(Dispatchers.IO) {
-        // Open can fail in many ways (no device, USB perm denied, PTP handshake bad).
-        // Wrap the whole open-and-enumerate path so any thrown IOException becomes
-        // a friendly message instead of an uncaught exception crashing the UI.
+    /**
+     * Scan a PTP camera profile. Tries direct PTP first (fast); if direct PTP
+     * isn't available on this device (no root + com.android.mtp still active)
+     * AND the profile already has a SAF source URI (from the system MTP
+     * provider, picked once by the user), falls back to a SAF probe — same
+     * code path MSC uses. Returns a friendly status string; never throws.
+     */
+    suspend fun scanConnectedCameraProfile(profileId: String? = null): String = withContext(Dispatchers.IO) {
+        // Try direct PTP first.
         val opened = try {
             NikonDirect.openDevice(ctx)
         } catch (t: Throwable) {
-            return@withContext "无法打开 PTP 相机：${t.message ?: t.javaClass.simpleName}"
-        } ?: return@withContext "没有打开 PTP 相机。请确认相机已连接、已授权 USB，并且直连加速设置已就绪。"
+            android.util.Log.w("CopyViewModel", "direct PTP open threw: ${t.message}")
+            null
+        }
+        if (opened == null) {
+            // Direct PTP unavailable. Fall back to SAF source if the profile has one.
+            val target = profileId?.let { id ->
+                settings.cameraProfilesSnapshot().firstOrNull { it.id == id }
+            } ?: settings.activeProfileSnapshot()
+            val safUri = target?.sourceTreeUri
+            return@withContext if (safUri != null) {
+                android.util.Log.i("CopyViewModel", "scanConnectedCameraProfile: falling back to SAF probe")
+                rescanSafSource(target.id)
+            } else {
+                "未能直连相机。请在下方点「选择源目录」，授权相机的文件夹访问（系统会弹出文件选择器，选中相机即可）。\n" +
+                    "提示：若设备已 root 且应用了「直连加速」，则不必选源目录，可直接扫描。"
+            }
+        }
 
         try {
             val files = try {

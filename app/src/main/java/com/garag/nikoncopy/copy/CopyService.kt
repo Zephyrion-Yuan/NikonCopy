@@ -68,9 +68,12 @@ class CopyService : Service() {
     }
 
     /**
-     * Begin a direct USB-PTP copy. Idempotent: a no-op if a copy is already running.
-     * There is intentionally no SAF/MTP source fallback; camera enumeration is owned
-     * by the app's PTP client so it never opens `content://com.android.mtp/...`.
+     * Begin a copy. Picks the best available source path:
+     *   - MSC profile → SAF tree (user-picked SD/U盘 root)
+     *   - PTP profile + direct PTP available (com.android.mtp disabled) → raw USB PTP (fast)
+     *   - PTP profile + SAF source URI saved (system MTP provider tree) → SAF (slower, non-root)
+     *   - none of the above → friendly error pointing the user at the Settings picker
+     * Idempotent: no-op if a copy is already running.
      */
     fun start(destinationTree: Uri, mode: CopyMode) {
         if (copyJob?.isActive == true) return
@@ -80,10 +83,10 @@ class CopyService : Service() {
 
         copyJob = scope.launch {
             // Resolve active profile up front so we know whether to take the
-            // PTP path or the SAF (MSC) path.
+            // PTP path or the SAF (MSC / system-MTP-provider) path.
             val activeNow = settings.activeProfileSnapshot()
             if (activeNow?.kind == com.garag.nikoncopy.data.DeviceKind.MSC) {
-                runMscCopy(activeNow, destinationTree, mode, startedAt)
+                runSafCopy(activeNow, destinationTree, mode, startedAt, label = "外接存储")
                 return@launch
             }
 
@@ -112,8 +115,19 @@ class CopyService : Service() {
 
             try {
                 if (opened == null) {
-                    val message = "无法打开相机 PTP 连接：请确认相机已通过 OTG 连接、已授予 USB 权限，并已在设置中完成直连加速配置。"
-                    android.util.Log.w("CopyService", "PTP-only copy aborted: open returned null")
+                    // Direct PTP unavailable — try the SAF fallback if the user
+                    // already authorized a system-MTP tree URI for this camera.
+                    val safUri = profile?.sourceTreeUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+                    if (profile != null && safUri != null && safUri != Uri.EMPTY) {
+                        android.util.Log.i("CopyService", "PTP direct unavailable; falling back to SAF source")
+                        // We've already startedAt-recorded above; pass it through to keep the cache consistent.
+                        runSafCopy(profile, destinationTree, mode, startedAt, label = "相机 (SAF)", srcOverride = safUri, recordStarted = false)
+                        return@launch
+                    }
+                    val message = "未能直连相机，且未授权相机文件夹访问。\n" +
+                        "请到「设置」→ 展开当前设备 → 点「选择源目录」，在系统弹出的文件选择器中选中相机后再试。\n" +
+                        "（若设备已 root 并应用了「直连加速」，则不必选源目录。）"
+                    android.util.Log.w("CopyService", "PTP copy aborted: no direct + no SAF fallback URI")
                     _state.value = CopyState.Failed(message)
                     updateNotification(0f, "失败", message)
                     return@launch
@@ -201,21 +215,29 @@ class CopyService : Service() {
     }
 
     /**
-     * MSC (SAF source) copy. The active profile owns its own destination URI
-     * (chosen during profile creation) and source SAF tree URI (the SD/USB
-     * volume root the user selected). We use the profile's persisted filter
-     * (selected dirs + extensions) so the user's "扫描" round in Settings
-     * scopes the actual copy.
+     * SAF-source copy. Handles both MSC (SD/U盘 SAF tree) and the PTP non-root
+     * fallback (system com.android.mtp DocumentsProvider tree). The active
+     * profile owns its own destination URI and SAF source URI; the filter is
+     * the user's selected source subdirs + selected file formats.
+     *
+     * @param srcOverride if non-null, use this tree URI instead of profile.sourceTreeUri
+     *                    (used by the PTP→SAF fallback so the caller can keep its already-resolved URI).
+     * @param recordStarted if false, skips recordCopyStarted (the outer flow already did it).
+     * @param label shown in the notification — "外接存储" or "相机 (SAF)" etc.
      */
-    private suspend fun runMscCopy(
+    private suspend fun runSafCopy(
         profile: com.garag.nikoncopy.data.DeviceProfile,
         destinationTree: Uri,
         mode: CopyMode,
         startedAt: Long,
+        label: String,
+        srcOverride: Uri? = null,
+        recordStarted: Boolean = true,
     ) {
-        val sourceTree = profile.sourceTreeUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        val sourceTree = srcOverride
+            ?: profile.sourceTreeUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
         if (sourceTree == null || sourceTree == Uri.EMPTY) {
-            val msg = "外接存储未选择源目录：请在设置中重新选择 SD / U 盘根目录。"
+            val msg = "未选择源目录：请在设置中展开此设备 → 点「选择源目录」。"
             _state.value = CopyState.Failed(msg)
             updateNotification(0f, "失败", msg)
             stopForegroundCompat()
@@ -234,7 +256,7 @@ class CopyService : Service() {
 
         val manifest = ManifestStore(applicationContext, profile.id)
         val engine = CopyEngine(applicationContext, manifest)
-        settings.recordCopyStarted(profile.id, startedAt)
+        if (recordStarted) settings.recordCopyStarted(profile.id, startedAt)
 
         val filter = CopyFilter(
             directories = profile.selectedDirectories,
@@ -242,10 +264,10 @@ class CopyService : Service() {
         )
         android.util.Log.i(
             "CopyService",
-            "using SAF (MSC) path profile=${profile.id} src=$sourceTree " +
+            "using SAF path ($label) profile=${profile.id} src=$sourceTree " +
                 "dirs=${filter.directories.size} exts=${filter.extensions.size}",
         )
-        updateNotification(0f, "正在扫描 (外接存储)…", null)
+        updateNotification(0f, "正在扫描 ($label)…", null)
 
         try {
             engine.copyFlowSaf(sourceTree, destination, mode, filter).collect { s ->
