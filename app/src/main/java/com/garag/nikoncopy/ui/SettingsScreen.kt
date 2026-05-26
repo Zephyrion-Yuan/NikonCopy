@@ -2,8 +2,8 @@ package com.garag.nikoncopy.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Sd
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Usb
 import androidx.compose.ui.draw.blur
 import androidx.compose.material3.AlertDialog
@@ -45,6 +47,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -111,11 +114,15 @@ fun SettingsScreen(
 
     // SAF tree picker for adding an MSC profile (SD card / USB stick).
     val pickMscTreeLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
+        ForceDocumentsUITreeContract()
     ) { uri: Uri? ->
+        PickerDiagnostics.onPickerResult("msc-tree", uri)
         val claimed = pendingDetectedMsc
         pendingDetectedMsc = null
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            notifyPickerCancelled(context)
+            return@rememberLauncherForActivityResult
+        }
         try {
             context.contentResolver.takePersistableUriPermission(
                 uri,
@@ -144,11 +151,16 @@ fun SettingsScreen(
     var pendingMscSourceProfileId by remember { mutableStateOf<String?>(null) }
 
     val pickMscSourceLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
+        ForceDocumentsUITreeContract()
     ) { uri: Uri? ->
+        PickerDiagnostics.onPickerResult("msc-source", uri)
         val profileId = pendingMscSourceProfileId
         pendingMscSourceProfileId = null
-        if (uri == null || profileId == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            notifyPickerCancelled(context)
+            return@rememberLauncherForActivityResult
+        }
+        if (profileId == null) return@rememberLauncherForActivityResult
         try {
             context.contentResolver.takePersistableUriPermission(
                 uri,
@@ -159,11 +171,15 @@ fun SettingsScreen(
     }
 
     val pickDestLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
+        ForceDocumentsUITreeContract()
     ) { uri: Uri? ->
+        PickerDiagnostics.onPickerResult("dest", uri)
         val profileId = pendingProfileDestination
         pendingProfileDestination = null
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            notifyPickerCancelled(context)
+            return@rememberLauncherForActivityResult
+        }
         try {
             context.contentResolver.takePersistableUriPermission(
                 uri,
@@ -219,6 +235,7 @@ fun SettingsScreen(
                     // MSC devices require a SAF tree URI — bounce through the picker.
                     if (detected is DetectedDevice.Msc) {
                         pendingDetectedMsc = detected
+                        android.util.Log.i("SettingsScreen", "launch picker [msc-tree-add] for detected=${detected.deviceName}")
                         pickMscTreeLauncher.launch(null)
                     } else {
                         vm.addProfileForDetected(detected)
@@ -226,6 +243,7 @@ fun SettingsScreen(
                 },
                 onAddMsc = {
                     pendingDetectedMsc = null
+                    android.util.Log.i("SettingsScreen", "launch picker [msc-tree-manual]")
                     pickMscTreeLauncher.launch(null)
                 },
             )
@@ -243,6 +261,7 @@ fun SettingsScreen(
                 onShowInfo = showInfo,
                 onAction = {
                     pendingProfileDestination = null
+                    android.util.Log.i("SettingsScreen", "launch picker [dest-default]")
                     pickDestLauncher.launch(null)
                 },
             )
@@ -253,15 +272,18 @@ fun SettingsScreen(
             // Per-card expansion override. Default: only the active profile
             // is expanded; everything else collapsed to its header.
             val expandOverride = remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
-            val detectedKeys = detectedDevices.map { it.deviceKey }.toSet()
             for (profile in profiles) {
                 Spacer(Modifier.height(12.dp))
                 val isMsc = profile.kind == DeviceKind.MSC
-                val ptpConnected = !isMsc && profile.deviceKey in detectedKeys
+                // Use [DeviceProfile.matches] so legacy `vid:pid:mfr:product`
+                // profiles still light up as connected when the detected key
+                // is now the upgraded `v2:vid:pid:serial` form.
+                val anyDetectedMatches = detectedDevices.any { profile.matches(it.deviceKey) }
+                val ptpConnected = !isMsc && anyDetectedMatches
                 // "Connected" means physically present right now. Having a saved
                 // sourceTreeUri only means we have permission to scan when it
                 // does come back — it isn't a connection signal.
-                val mscConnected = isMsc && profile.deviceKey in detectedKeys
+                val mscConnected = isMsc && anyDetectedMatches
                 val connected = ptpConnected || mscConnected
                 // Rescan is meaningful whenever any source path is available:
                 // - direct PTP (camera connected + 直连加速 ready), OR
@@ -285,6 +307,7 @@ fun SettingsScreen(
                     },
                     onPickDestination = {
                         pendingProfileDestination = profile.id
+                        android.util.Log.i("SettingsScreen", "launch picker [dest-profile=${profile.id}]")
                         pickDestLauncher.launch(null)
                     },
                     // Both MSC and PTP profiles can carry a SAF source URI now:
@@ -292,6 +315,7 @@ fun SettingsScreen(
                     // com.android.mtp provider tree (non-root fallback).
                     onPickMscSource = {
                         pendingMscSourceProfileId = profile.id
+                        android.util.Log.i("SettingsScreen", "launch picker [msc-source-profile=${profile.id}]")
                         pickMscSourceLauncher.launch(null)
                     },
                     onToggleDirectory = { dir, selected ->
@@ -300,6 +324,7 @@ fun SettingsScreen(
                     onToggleExtension = { ext, selected ->
                         vm.setProfileExtension(profile.id, ext, selected)
                     },
+                    onEnableCopyStructure = { vm.enableCopyDirectoryStructure(profile.id) },
                     onDelete = { vm.deleteProfile(profile.id) },
                     onRescan = if (canRescan) {
                         {
@@ -429,6 +454,27 @@ fun SettingsScreen(
                 },
             )
 
+            Spacer(Modifier.height(16.dp))
+
+            SettingRow(
+                title = "导出运行日志",
+                subtitle = "通过系统分享面板发送到聊天 / 邮件 / 网盘（用于反馈问题）",
+                actionIcon = Icons.Outlined.Share,
+                actionLabel = "分享",
+                info = InfoContent(
+                    title = "导出运行日志",
+                    body = "本应用启动后会在内存中保留最近 ~2000 行 logcat 日志（仅本应用的，没有读取系统日志的权限）。\n\n" +
+                        "点击「分享」会把以下范围的事件写入一个 .txt 文件，并打开系统分享面板，让你选择微信 / Telegram / 邮件 / 网盘等任意应用发送：\n" +
+                        "· MainActivity 生命周期\n" +
+                        "· 文件选择器 (PickTreeContract) 的请求/响应\n" +
+                        "· 设备扫描 / 拷贝 / 修复日期\n" +
+                        "· 所有警告与错误\n\n" +
+                        "文件会临时存放在应用外部缓存目录，分享后可手动清理（或交给系统清理缓存）。",
+                ),
+                onShowInfo = showInfo,
+                onAction = { shareLogFile(context) },
+            )
+
         }
     }
     } // end blur Box
@@ -496,6 +542,70 @@ private data class PatchDialogContent(
 internal data class InfoContent(val title: String, val body: String)
 
 /**
+ * Export the in-memory log buffer to a timestamped .txt file and pop the
+ * system share sheet so the user can hand it off to any messaging / email /
+ * cloud app on their phone.
+ *
+ * Implementation notes:
+ *  - File lives in [Context.externalCacheDir] (declared in
+ *    `res/xml/file_paths.xml` under `<external-cache-path>`) so FileProvider
+ *    can grant URI permission on it. Internal storage / DataStore paths are
+ *    intentionally NOT exposed.
+ *  - `FLAG_GRANT_READ_URI_PERMISSION` on the chooser intent gives every
+ *    target activity a one-shot read grant. No persistent URI permission is
+ *    issued, so the file becomes inaccessible to those apps once the share
+ *    completes (modulo any explicit copy they make).
+ *  - `ACTION_SEND` with `text/plain` MIME catches every chat / mail / cloud
+ *    app on the device that advertises plain-text receivers; the chooser
+ *    picks among them.
+ */
+private fun shareLogFile(context: android.content.Context) {
+    val file = com.garag.nikoncopy.util.LogCollector.exportToFile(context)
+    if (file == null) {
+        Toast.makeText(context, "导出日志失败（无法写入缓存目录）", Toast.LENGTH_LONG).show()
+        return
+    }
+    try {
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, "NikonCopy 运行日志 · ${file.name}")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = Intent.createChooser(send, "分享 NikonCopy 运行日志").apply {
+            // Chooser may be launched from a non-activity context in rare lifecycle
+            // edge cases; the flag is harmless when not needed and required when so.
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(chooser)
+    } catch (t: Throwable) {
+        android.util.Log.w("SettingsScreen", "shareLogFile failed: ${t.message}", t)
+        Toast.makeText(context, "无法打开分享面板：${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * Surfaced when the OPEN_DOCUMENT_TREE launcher returns a null URI — either the
+ * user genuinely cancelled OR an OEM file-manager (HyperOS, MIUI in particular)
+ * dismissed the consent dialog prematurely. A toast is the right register: not
+ * loud enough to startle when it's a real cancel, but a useful signal when the
+ * picker auto-dismissed and the user is left wondering what just happened.
+ */
+private fun notifyPickerCancelled(context: android.content.Context) {
+    Toast.makeText(
+        context,
+        "未选择目录。若授权弹窗一闪而过，可能是 OEM 文件管理器拦截：" +
+            "用系统「文件」（DocumentsUI）打开后重试，或在文件管理器设置里关闭默认打开方式。",
+        Toast.LENGTH_LONG,
+    ).show()
+}
+
+/**
  * Horizontal row of device chips. Saved profiles appear first (highlighted when
  * active); detected-but-unsaved devices appear next as "+ Add" affordances; a
  * permanent trailing "+ SD/U盘" chip launches the SAF tree picker so the user
@@ -510,9 +620,10 @@ private fun DevicePickerRow(
     onAddDetected: (DetectedDevice) -> Unit,
     onAddMsc: () -> Unit,
 ) {
-    val savedKeys = profiles.map { it.deviceKey }.toSet()
-    val unsavedDetected = detected.filter { it.deviceKey !in savedKeys }
-    val detectedKeys = detected.map { it.deviceKey }.toSet()
+    // "Unsaved" = detected device that no saved profile claims (using the
+    // legacy-tolerant matcher so a freshly-upgraded v2 key isn't misidentified
+    // as "new" when an old `vid:pid:mfr:product` profile already represents it).
+    val unsavedDetected = detected.filter { d -> profiles.none { it.matches(d.deviceKey) } }
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -546,7 +657,7 @@ private fun DevicePickerRow(
                     DeviceChip(
                         label = p.deviceName,
                         kind = p.kind,
-                        connected = p.deviceKey in detectedKeys,
+                        connected = detected.any { p.matches(it.deviceKey) },
                         active = p.id == activeProfileId,
                         onClick = { onSelectProfile(p.id) },
                     )
@@ -711,12 +822,39 @@ private fun CameraProfileCard(
     onPickMscSource: (() -> Unit)? = null,
     onToggleDirectory: (String, Boolean) -> Unit,
     onToggleExtension: (String, Boolean) -> Unit,
+    onEnableCopyStructure: () -> Unit,
     onDelete: () -> Unit,
     onRescan: (() -> Unit)? = null,
     rescanInProgress: Boolean = false,
     rescanMessage: String? = null,
     onShowInfo: ((String, String) -> Unit)? = null,
 ) {
+    // Confirmation dialog for the irreversible "preserve directory structure" flip.
+    var showStructureWarning by remember { mutableStateOf(false) }
+    if (showStructureWarning) {
+        AlertDialog(
+            onDismissRequest = { showStructureWarning = false },
+            title = { Text("启用「拷贝目录结构」？") },
+            text = {
+                Text(
+                    "启用后，此设备的拷贝结果会按源目录的层级，落在「保存目录 / 设备子目录 / 源目录路径」之下。\n\n" +
+                        "此选项不可关闭：如需切回扁平模式，请删除此设备配置并重新添加。\n\n" +
+                        "已存在于保存目录中的旧文件不会被移动，新拷贝才会进入子目录。",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onEnableCopyStructure()
+                    showStructureWarning = false
+                }) { Text("启用") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showStructureWarning = false }) { Text("取消") }
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+        )
+    }
     // Collapsed cards visually recede so the active/connected one stands out.
     val cardColor =
         if (expanded) MaterialTheme.colorScheme.surfaceVariant
@@ -847,6 +985,53 @@ private fun CameraProfileCard(
                 }
 
                 Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "拷贝目录结构",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            if (onShowInfo != null) {
+                                InfoIcon {
+                                    onShowInfo(
+                                        "拷贝目录结构",
+                                        "默认关闭：所有文件都直接落在「保存目录」下，扁平存放。\n\n" +
+                                            "开启后：在保存目录下为此设备建一个子目录（首次拷贝时自动分配，撞名加 (2)/(3)），" +
+                                            "源文件按原本的层级关系拷贝到该子目录内。多个设备 / 多张 SD 卡互不干扰，同名文件不会跨设备误判。\n\n" +
+                                            "⚠️ 不可逆：一旦此设备发生过任何拷贝（或此选项已开启），就无法再切换。若需切回扁平模式，请删除此设备配置后重新添加。\n\n" +
+                                            "已存在的旧文件不会被移动；新拷贝才会进入子目录。"
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            when {
+                                profile.copyDirectoryStructure -> "已开启 · 不可关闭"
+                                profile.structureLocked -> "此设备已发生过拷贝，无法再开启（已锁定为扁平模式）"
+                                else -> "关闭 · 拷贝为扁平模式"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Switch(
+                        checked = profile.copyDirectoryStructure,
+                        enabled = !profile.structureLocked,
+                        onCheckedChange = { wantOn ->
+                            if (wantOn && !profile.structureLocked) {
+                                showStructureWarning = true
+                            }
+                            // off→on confirmed via dialog; on→off and locked paths are no-ops.
+                        },
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
                 Text(
                     "选定文件格式",
                     style = MaterialTheme.typography.bodyMedium,
@@ -858,32 +1043,81 @@ private fun CameraProfileCard(
                 } else {
                     extensions.forEach { ext ->
                         val selected = ext in profile.selectedExtensions
+                        // Unchecked rows are always free to check; only the last
+                        // remaining checked one is locked (so the user can't end
+                        // up with zero formats selected).
                         ProfileCheckRow(
                             label = extensionLabel(ext),
                             checked = selected,
-                            enabled = selected || profile.selectedExtensions.size > 1,
+                            enabled = !selected || profile.selectedExtensions.size > 1,
                             onCheckedChange = { onToggleExtension(ext, it) },
                         )
                     }
                 }
 
                 Spacer(Modifier.height(8.dp))
-                Text(
-                    "源子目录",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "源子目录",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        if (profile.selectedDirectories.isEmpty()) "（未勾选 · 将导入全部）"
+                        else "（仅导入勾选项）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (profile.selectedDirectories.isEmpty())
+                            MaterialTheme.colorScheme.primary
+                        else
+                            MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                // Newest-first sort: per-dir max mtime descending; dirs without
+                // a recorded mtime fall back to path-alphabetical at the bottom.
+                // The mtime map is populated by MediaProbe / PTP scan.
+                val dirs = profile.detectedDirectories.sortedWith(
+                    compareByDescending<String> { profile.detectedDirectoryTimes[it] ?: 0L }
+                        .thenBy { it }
                 )
-                val dirs = profile.detectedDirectories.sorted()
                 if (dirs.isEmpty()) {
                     Text("未检测到源子目录", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    dirs.forEach { dir ->
-                        val selected = dir in profile.selectedDirectories
-                        ProfileCheckRow(
-                            label = directoryLabel(dir),
-                            checked = selected,
-                            enabled = selected || profile.selectedDirectories.size > 1,
-                            onCheckedChange = { onToggleDirectory(dir, it) },
+                    // Dir filter is fully optional: zero selections is meaningful
+                    // (= "import everything in scope"). The UI no longer locks
+                    // the last remaining checked row.
+                    //
+                    // Internal scrolling: when the list exceeds ~6 rows the
+                    // section caps at 280dp and scrolls within itself so the
+                    // rest of the settings page doesn't get pushed off-screen.
+                    // Modern Compose (1.5+) supports nesting verticalScroll
+                    // inside an outer verticalScroll as long as the inner has
+                    // a bounded height — heightIn(max=…) provides that bound.
+                    val INNER_SCROLL_THRESHOLD = 6
+                    val needsInternalScroll = dirs.size > INNER_SCROLL_THRESHOLD
+                    val dirListModifier = if (needsInternalScroll) {
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 280.dp)
+                            .verticalScroll(rememberScrollState())
+                    } else Modifier.fillMaxWidth()
+                    Column(modifier = dirListModifier) {
+                        dirs.forEach { dir ->
+                            val selected = dir in profile.selectedDirectories
+                            ProfileCheckRow(
+                                label = directoryLabel(dir),
+                                checked = selected,
+                                enabled = true,
+                                onCheckedChange = { onToggleDirectory(dir, it) },
+                            )
+                        }
+                    }
+                    if (needsInternalScroll) {
+                        Text(
+                            "共 ${dirs.size} 个 · 按创建时间降序 · 列表可滚动",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
                         )
                     }
                 }

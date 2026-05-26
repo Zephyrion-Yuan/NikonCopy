@@ -128,9 +128,10 @@ fun HomeScreen(
         ) {
             ActiveDeviceChip(
                 profileName = activeProfile?.deviceName,
-                connected = activeProfile?.deviceKey?.let { key ->
-                    detectedDevices.any { it.deviceKey == key }
+                connected = activeProfile?.let { p ->
+                    detectedDevices.any { p.matches(it.deviceKey) }
                 } ?: false,
+                filterSummary = activeProfile?.let { selectionSummary(it) },
                 onClick = onOpenSettings,
                 onShowInfo = showInfo,
             )
@@ -355,9 +356,14 @@ private fun ProgressArea(
         }
         is CopyState.Done -> {
             val skipPart = if (state.filesSkipped > 0) " · 跳过 ${state.filesSkipped}" else ""
+            val sizePart = "${CopyService.humanSize(state.totalBytes)} · ${state.elapsedMillis / 1000.0} 秒"
             ProgressCard(
-                title = "完成",
-                subtitle = "拷贝 ${state.filesCopied}$skipPart · ${CopyService.humanSize(state.totalBytes)} · ${state.elapsedMillis / 1000.0} 秒",
+                title = if (state.filesFailed > 0) "完成（有 ${state.filesFailed} 个失败）" else "完成",
+                titleColor = if (state.filesFailed > 0) MaterialTheme.colorScheme.error else null,
+                subtitle = if (state.filesFailed > 0)
+                    "拷贝 ${state.filesCopied}$skipPart · $sizePart · 再次点击「拷贝」可重试失败项"
+                else
+                    "拷贝 ${state.filesCopied}$skipPart · $sizePart",
                 progress = 1f,
                 rate = null,
                 actionLabel = "确定",
@@ -386,6 +392,7 @@ private fun ProgressCard(
     rate: String?,
     actionLabel: String,
     onAction: () -> Unit,
+    titleColor: Color? = null,
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -397,7 +404,8 @@ private fun ProgressCard(
                 Text(
                     title,
                     style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = titleColor ?: MaterialTheme.colorScheme.onSurface,
+                    fontWeight = if (titleColor != null) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.weight(1f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -502,6 +510,7 @@ internal fun friendlyTreePath(treeUri: String): String {
 private fun ActiveDeviceChip(
     profileName: String?,
     connected: Boolean,
+    filterSummary: String?,
     onClick: () -> Unit,
     onShowInfo: ((String, String) -> Unit)? = null,
 ) {
@@ -545,6 +554,15 @@ private fun ActiveDeviceChip(
                     style = MaterialTheme.typography.bodyLarge,
                     color = content,
                 )
+                if (filterSummary != null) {
+                    Text(
+                        filterSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = content.copy(alpha = 0.85f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             Text(
                 if (connected) "已连接" else if (profileName == null) "" else "未连接",
@@ -553,4 +571,32 @@ private fun ActiveDeviceChip(
             )
         }
     }
+}
+
+/**
+ * Render a one-line summary of what this profile will actually copy on the next
+ * run, so the user gets a glance-check from the home screen without diving into
+ * settings.
+ *
+ * Three cases:
+ *   - No detected dirs yet → null (chip stays compact; user hasn't scanned).
+ *   - Empty selection → "导入所有源子目录" (Q3 semantics: no filter = take all).
+ *   - Partial selection → "已选 N/M 子目录: A, B, +X 更多" (first 2 names + count).
+ */
+private fun selectionSummary(profile: com.garag.nikoncopy.data.CameraProfile): String? {
+    val total = profile.detectedDirectories.size
+    if (total == 0) return null
+    if (profile.selectedDirectories.isEmpty()) return "导入所有源子目录（$total 个）"
+    if (profile.selectedDirectories.size == total) return "已选全部 $total 个子目录"
+    // Show the user's selected ones — keep the original UI sort so summary
+    // mirrors what they see in settings. Display the first two; condense rest
+    // into "+N 更多".
+    val sortedSelected = profile.selectedDirectories.sortedWith(
+        compareByDescending<String> { profile.detectedDirectoryTimes[it] ?: 0L }
+            .thenBy { it }
+    )
+    val n = profile.selectedDirectories.size
+    val head = sortedSelected.take(2).joinToString(", ") { it.substringAfterLast('/').ifBlank { "根目录" } }
+    val tail = if (n > 2) "，+${n - 2} 更多" else ""
+    return "已选 $n/$total: $head$tail"
 }

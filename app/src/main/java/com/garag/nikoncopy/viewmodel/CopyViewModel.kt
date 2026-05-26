@@ -75,10 +75,10 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
             val detected = _detectedDevices.value
             if (detected.isEmpty()) return@launch
             val current = settings.activeProfileSnapshot()
-            val currentMatches = detected.any { it.deviceKey == current?.deviceKey }
+            val currentMatches = current != null && detected.any { current.matches(it.deviceKey) }
             if (currentMatches) return@launch
             val matchingProfile = settings.cameraProfilesSnapshot()
-                .firstOrNull { p -> detected.any { it.deviceKey == p.deviceKey } }
+                .firstOrNull { p -> detected.any { p.matches(it.deviceKey) } }
             if (matchingProfile != null && matchingProfile.id != current?.id) {
                 settings.setActiveProfile(matchingProfile.id)
             }
@@ -146,8 +146,10 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
             return@withContext "在 ${result.totalDirsScanned} 个目录中未找到任何媒体文件" +
                 if (result.bailedOnLimit) "（已达扫描上限）" else ""
         }
+        android.util.Log.i("CopyViewModel", "rescanSafSource: probe done — ${result.directories.size} dirs, ${result.allExtensions.size} ext kinds")
         val detectedDirs = result.allDirectories
         val detectedExts = result.allExtensions
+        val detectedDirTimes = result.directories.associate { it.path to it.lastModifiedAt }
         // Default selections: keep prior selections that still exist; otherwise
         // start with everything detected (typical "import all" behaviour).
         val selectedDirs = profile.selectedDirectories
@@ -162,6 +164,7 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 detectedDirectories = detectedDirs,
                 detectedExtensions = detectedExts,
+                detectedDirectoryTimes = detectedDirTimes,
                 selectedDirectories = selectedDirs,
                 selectedExtensions = selectedExts,
                 updatedAt = System.currentTimeMillis(),
@@ -169,8 +172,8 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
         }
         val mode = if (result.usedConventionProbe) "约定扫描" else "全量 BFS"
         val limitNote = if (result.bailedOnLimit) "（已达扫描上限）" else ""
-        "$mode 完成：${result.totalMediaFiles} 个媒体文件，${detectedDirs.size} 个目录，" +
-            "${detectedExts.size} 种文件格式，耗时 ${result.elapsedMs / 1000.0} 秒$limitNote"
+        "$mode 完成：${detectedDirs.size} 个目录，${detectedExts.size} 种文件格式，" +
+            "耗时 ${result.elapsedMs / 1000.0} 秒$limitNote"
     }
 
     /** Back-compat alias used elsewhere. */
@@ -293,6 +296,10 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
             }
             val detectedDirs = files.map { it.directoryPath }.toSortedSet()
             val detectedExts = files.map { it.extension }.filter { it.isNotBlank() }.toSortedSet()
+            // Per-dir max mtime — drives the settings UI's newest-first sort.
+            val detectedDirTimes: Map<String, Long> = files
+                .groupBy { it.directoryPath }
+                .mapValues { (_, list) -> list.maxOf { it.dateModifiedMillis } }
             val existing = settings.cameraProfilesSnapshot()
                 .firstOrNull { it.matches(opened.deviceKey) }
             val selectedDirs = existing?.selectedDirectories
@@ -305,8 +312,18 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
                 ?.toSet()
                 ?.takeIf { it.isNotEmpty() }
                 ?: detectedExts
-            val profile = CameraProfile(
-                id = existing?.id ?: opened.deviceKey,
+            // CRITICAL: rescan must preserve user-set fields on the existing
+            // profile (copyDirectoryStructure, cacheStartedAt/CompletedAt,
+            // sourceTreeUri, lastFixCompletedAt, …). Earlier versions
+            // re-constructed `CameraProfile(...)` from scratch which silently
+            // reset every unlisted field — re-scanning a structure-mode profile
+            // would lose the irreversible flag, and rescanning after a copy
+            // would lose the "已拷贝" record so the lock would unlock.
+            val profile = (existing ?: CameraProfile(
+                id = opened.deviceKey,
+                deviceKey = opened.deviceKey,
+                deviceName = opened.deviceName,
+            )).copy(
                 deviceKey = opened.deviceKey,
                 deviceName = opened.deviceName,
                 destinationUri = existing?.destinationUri ?: destinationUri.value,
@@ -314,6 +331,7 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
                 selectedExtensions = selectedExts,
                 detectedDirectories = detectedDirs,
                 detectedExtensions = detectedExts,
+                detectedDirectoryTimes = detectedDirTimes,
                 updatedAt = System.currentTimeMillis(),
             )
             settings.upsertCameraProfile(profile)
@@ -366,6 +384,24 @@ class CopyViewModel(app: Application) : AndroidViewModel(app) {
                     profile.selectedDirectories - directory
                 }
                 profile.copy(selectedDirectories = next)
+            }
+        }
+    }
+
+    /**
+     * Turn on the directory-structure-preserving copy mode for [profileId].
+     * Irreversible — refuses to flip the flag back off once set, and refuses
+     * to set it once any copy has run for this profile (preventing the
+     * half-flat-half-nested mess we don't have de-dup semantics for).
+     */
+    fun enableCopyDirectoryStructure(profileId: String) {
+        viewModelScope.launch {
+            settings.updateCameraProfile(profileId) { profile ->
+                if (profile.structureLocked) profile
+                else profile.copy(
+                    copyDirectoryStructure = true,
+                    updatedAt = System.currentTimeMillis(),
+                )
             }
         }
     }

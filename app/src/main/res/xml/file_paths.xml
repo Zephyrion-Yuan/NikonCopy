@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider paths exposed to other apps via Intent.ACTION_SEND.
+
+    The "external_cache" root maps to Context.externalCacheDir, which is where
+    LogCollector.exportToFile drops the timestamped log dump.  We deliberately
+    do NOT expose internal storage / DataStore / the destination tree — the
+    only thing other apps can read through our FileProvider is the log
+    dump we hand them via a one-shot URI permission grant.
+-->
+<paths>
+    <external-cache-path name="external_cache" path="." />
+</paths>

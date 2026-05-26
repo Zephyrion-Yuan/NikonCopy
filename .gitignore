@@ -30,6 +30,11 @@ nikon_debug/
 APP_DEV_LOG.md
 AGENTS.md
 XIAOHONGSHU_DRAFT.md
+PLAN_*.md
+TODO_*.md
 
 # Source art (Adobe Illustrator). nikoncopy.svg is the committed export.
 *.ai
+
+# Built / released APK artifacts at repo root (uploaded to GH releases, not committed).
+NikonCopy.v*.apk

@@ -17,8 +17,10 @@ import com.garag.nikoncopy.mtp.PtpClient
 import java.io.FileOutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -38,6 +40,17 @@ private const val TAG = "CopyEngine"
 private val EXIF_EXTS = setOf("nef", "arw", "dng", "jpg", "jpeg", "heif", "heic", "hif")
 private val MEDIASTORE_ROOTS = setOf("Pictures", "DCIM", "Movies")
 
+/**
+ * If a SAF/MSC file copy makes no forward progress for this long, the watchdog
+ * cancels the in-flight transfer and the engine moves on (eventually retrying
+ * in the end-of-batch retry pass). 3 s is aggressive — healthy SD/MSC paths
+ * sustain MB/s throughput with sub-second worst-case pauses, so a 3 s freeze
+ * is almost certainly a USB endpoint stall worth recovering from rather than
+ * a slow file we should patiently wait for.
+ */
+private const val SAF_STALL_TIMEOUT_MS = 3_000L
+private const val SAF_STALL_CHECK_INTERVAL_MS = 500L
+
 class CopyEngine(
     private val context: Context,
     private val manifest: ManifestStore,
@@ -56,17 +69,25 @@ class CopyEngine(
         destinationTreeUri: Uri,
         mode: CopyMode,
         filter: CopyFilter = CopyFilter(),
+        layout: CopyLayout = CopyLayout(),
     ): Flow<CopyState> = channelFlow {
         send(CopyState.Scanning(0))
         val resolver = context.contentResolver
 
         val allManifest = manifest.loadAll()
-        val orphansCleaned = cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
-        val initialExisting = readDestinationNames(resolver, destinationTreeUri) - orphansCleaned
-        val diskRecovered = recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
+        // Pending-orphan cleanup + disk recovery only make sense in flat mode for v1:
+        // both helpers assume root-level files and would need cross-cutting rework
+        // to walk an arbitrary structure-mode subtree. Skipping them in structure
+        // mode is safe — the manifest + recursive destination walk still produce a
+        // correct existingNames set.
+        val orphansCleaned = if (layout.preservesStructure) emptySet()
+            else cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
+        val initialExisting = readDestinationKeys(resolver, destinationTreeUri, layout) - orphansCleaned
+        val diskRecovered = if (layout.preservesStructure) emptySet()
+            else recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
         val existingNames = initialExisting + diskRecovered
         val manifestNames = if (mode == CopyMode.INCREMENTAL) allManifest else emptySet()
-        Log.i(TAG, "[direct] mode=$mode existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
+        Log.i(TAG, "[direct] mode=$mode layout=${if (layout.preservesStructure) "structured(${layout.subdir})" else "flat"} existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
 
         val candidates = try {
             ptp.listFiles()
@@ -79,9 +100,10 @@ class CopyEngine(
         }.filter { filter.accepts(it.directoryPath, it.extension) }
 
         val (toCopy, toSkip) = candidates.partition { f ->
+            val key = layout.keyFor(f.directoryPath, f.name)
             when (mode) {
-                CopyMode.ALL -> f.name !in existingNames
-                CopyMode.INCREMENTAL -> f.name !in existingNames && f.name !in manifestNames
+                CopyMode.ALL -> key !in existingNames
+                CopyMode.INCREMENTAL -> key !in existingNames && key !in manifestNames
             }
         }
         send(CopyState.Scanning(candidates.size))
@@ -156,7 +178,11 @@ class CopyEngine(
         suspend fun attemptCopy(mtpFile: MtpFile, attemptLabel: String): Long {
             val mime = guessMime(mtpFile.name)
             val (newDoc, isMediaStore) = try {
-                createDestinationUri(resolver, destDir, mediaStoreRelPath, mtpFile.name, mime)
+                createDestinationUriIn(
+                    resolver, destinationTreeUri, destDir, mediaStoreRelPath,
+                    sourceRelPath = mtpFile.directoryPath, layout = layout,
+                    fileName = mtpFile.name, mime = mime,
+                )
             } catch (t: Throwable) {
                 Log.e(TAG, "[direct] $attemptLabel createDocument failed for ${mtpFile.name}: ${t.message}")
                 return -1
@@ -192,7 +218,8 @@ class CopyEngine(
             priorTotalBytes.addAndGet(copiedBytes)
             perFileBytes.set(0)
 
-            session.add(mtpFile.name)
+            val manifestKey = layout.keyFor(mtpFile.directoryPath, mtpFile.name)
+            session.add(manifestKey)
             batch.add(mtpFile.name, isMediaStore, newDoc)
             // Note: do NOT publish (IS_PENDING=1 stays). fix-dates will
             // publish with DATE_TAKEN in one update to avoid Xiaomi Gallery
@@ -268,6 +295,7 @@ class CopyEngine(
             send(CopyState.Done(
                 filesCopied = filesCopied,
                 filesSkipped = toSkip.size,
+                filesFailed = failedFiles.size,
                 totalBytes = totalBytes,
                 elapsedMillis = elapsed,
             ))
@@ -320,17 +348,21 @@ class CopyEngine(
         destinationTreeUri: Uri,
         mode: CopyMode,
         filter: CopyFilter = CopyFilter(),
+        layout: CopyLayout = CopyLayout(),
     ): Flow<CopyState> = channelFlow {
         send(CopyState.Scanning(0))
         val resolver = context.contentResolver
 
         val allManifest = manifest.loadAll()
-        val orphansCleaned = cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
-        val initialExisting = readDestinationNames(resolver, destinationTreeUri) - orphansCleaned
-        val diskRecovered = recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
+        // See [copyFlowDirect] comment — orphan cleanup / disk recovery only run in flat mode.
+        val orphansCleaned = if (layout.preservesStructure) emptySet()
+            else cleanupOrphanPending(resolver, destinationTreeUri, allManifest)
+        val initialExisting = readDestinationKeys(resolver, destinationTreeUri, layout) - orphansCleaned
+        val diskRecovered = if (layout.preservesStructure) emptySet()
+            else recoverDiskPendingOrphans(resolver, destinationTreeUri, initialExisting)
         val existingNames = initialExisting + diskRecovered
         val manifestNames = if (mode == CopyMode.INCREMENTAL) allManifest else emptySet()
-        Log.i(TAG, "[saf] mode=$mode existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
+        Log.i(TAG, "[saf] mode=$mode layout=${if (layout.preservesStructure) "structured(${layout.subdir})" else "flat"} existing=${existingNames.size} orphansCleaned=${orphansCleaned.size} diskRecovered=${diskRecovered.size} manifest=${manifestNames.size}")
 
         val candidates = try {
             walkSafTree(resolver, sourceTreeUri, filter)
@@ -343,9 +375,10 @@ class CopyEngine(
         }
 
         val (toCopy, toSkip) = candidates.partition { f ->
+            val key = layout.keyFor(f.parentPath, f.name)
             when (mode) {
-                CopyMode.ALL -> f.name !in existingNames
-                CopyMode.INCREMENTAL -> f.name !in existingNames && f.name !in manifestNames
+                CopyMode.ALL -> key !in existingNames
+                CopyMode.INCREMENTAL -> key !in existingNames && key !in manifestNames
             }
         }
         send(CopyState.Scanning(candidates.size))
@@ -409,51 +442,122 @@ class CopyEngine(
         var filesCopied = 0
         val failedFiles = mutableListOf<SafFile>()
 
+        /**
+         * Attempt one SAF copy with a per-file stall watchdog. Returns
+         * copiedBytes on success, -1 on any failure (createDocument, copy
+         * cancellation due to stall, I/O error). Cleans up partial rows in
+         * either MediaStore or SAF on failure so retries get a clean slot.
+         */
+        suspend fun attemptSafCopy(srcFile: SafFile, attemptLabel: String): Long {
+            val mime = guessMime(srcFile.name)
+            val (newDoc, isMediaStore) = try {
+                createDestinationUriIn(
+                    resolver, destinationTreeUri, destDir, mediaStoreRelPath,
+                    sourceRelPath = srcFile.parentPath, layout = layout,
+                    fileName = srcFile.name, mime = mime,
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "[saf] $attemptLabel createDocument failed for ${srcFile.name}: ${t.message}")
+                return -1
+            }
+            val fileStartNanos = System.nanoTime()
+            val signal = android.os.CancellationSignal()
+            val watchdog = launch(Dispatchers.Default) {
+                var lastBytes = perFileBytes.get()
+                var lastChangeNanos = System.nanoTime()
+                try {
+                    while (isActive) {
+                        delay(SAF_STALL_CHECK_INTERVAL_MS)
+                        val bytes = perFileBytes.get()
+                        val now = System.nanoTime()
+                        if (bytes != lastBytes) {
+                            lastBytes = bytes
+                            lastChangeNanos = now
+                        } else if ((now - lastChangeNanos) / 1_000_000L >= SAF_STALL_TIMEOUT_MS) {
+                            Log.w(TAG, "[saf] $attemptLabel ${srcFile.name} stalled ${SAF_STALL_TIMEOUT_MS}ms — cancelling")
+                            try { signal.cancel() } catch (_: Throwable) {}
+                            break
+                        }
+                    }
+                } catch (_: CancellationException) {}
+            }
+            val copied = try {
+                withContext(Dispatchers.IO) {
+                    copyOneViaSaf(resolver, srcFile, newDoc, signal) { bytes -> perFileBytes.set(bytes) }
+                }
+            } catch (ce: CancellationException) {
+                // Two callers can cancel the FileUtils.copy: the watchdog (treat
+                // as per-file failure, keep going) or the parent flow being
+                // cancelled by the user (must propagate). Distinguish by checking
+                // whether the watchdog fired vs whether the channelFlow's job
+                // is still active.
+                watchdog.cancel()
+                runCatching {
+                    if (isMediaStore) resolver.delete(newDoc, null, null)
+                    else DocumentsContract.deleteDocument(resolver, newDoc)
+                }
+                if (!currentCoroutineContext()[Job]!!.isActive) throw ce
+                return -1
+            } catch (t: Throwable) {
+                watchdog.cancel()
+                Log.e(TAG, "[saf] $attemptLabel ${srcFile.name} failed: ${t.message}")
+                runCatching {
+                    if (isMediaStore) resolver.delete(newDoc, null, null)
+                    else DocumentsContract.deleteDocument(resolver, newDoc)
+                }
+                return -1
+            } finally {
+                watchdog.cancel()
+            }
+            val fileMs = (System.nanoTime() - fileStartNanos) / 1_000_000L
+            val fileMBs = if (fileMs > 0) copied / 1024.0 / 1024.0 / (fileMs / 1000.0) else 0.0
+            Log.i(TAG, "[saf] $attemptLabel ${srcFile.name} ${copied}B in ${fileMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf-dst]"}".format(fileMBs))
+
+            priorTotalBytes.addAndGet(copied)
+            perFileBytes.set(0)
+
+            val manifestKey = layout.keyFor(srcFile.parentPath, srcFile.name)
+            session.add(manifestKey)
+            batch.add(srcFile.name, isMediaStore, newDoc)
+            return copied
+        }
+
         try {
+            // -------- First pass: one attempt per file with stall watchdog --------
             for ((idx, srcFile) in toCopy.withIndex()) {
                 currentIndex.set(idx + 1)
                 currentName.set(srcFile.name)
                 perFileBytes.set(0)
-
-                val mime = guessMime(srcFile.name)
-                val (newDoc, isMediaStore) = try {
-                    createDestinationUri(resolver, destDir, mediaStoreRelPath, srcFile.name, mime)
-                } catch (t: Throwable) {
-                    Log.e(TAG, "[saf] createDocument failed for ${srcFile.name}: ${t.message}")
+                val bytes = attemptSafCopy(srcFile, "try1")
+                if (bytes < 0) {
                     failedFiles += srcFile
                     continue
                 }
-
-                val fileStartNanos = System.nanoTime()
-                val copied = try {
-                    withContext(Dispatchers.IO) {
-                        copyOneViaSaf(resolver, srcFile, newDoc) { bytes -> perFileBytes.set(bytes) }
-                    }
-                } catch (ce: CancellationException) {
-                    runCatching {
-                        if (isMediaStore) resolver.delete(newDoc, null, null)
-                        else DocumentsContract.deleteDocument(resolver, newDoc)
-                    }
-                    throw ce
-                } catch (t: Throwable) {
-                    Log.e(TAG, "[saf] copy failed for ${srcFile.name}: ${t.message}")
-                    runCatching {
-                        if (isMediaStore) resolver.delete(newDoc, null, null)
-                        else DocumentsContract.deleteDocument(resolver, newDoc)
-                    }
-                    failedFiles += srcFile
-                    continue
-                }
-                val fileMs = (System.nanoTime() - fileStartNanos) / 1_000_000L
-                val fileMBs = if (fileMs > 0) copied / 1024.0 / 1024.0 / (fileMs / 1000.0) else 0.0
-                Log.i(TAG, "[saf] ${srcFile.name} ${copied}B in ${fileMs}ms = %.1f MB/s ${if (isMediaStore) "[mediastore]" else "[saf-dst]"}".format(fileMBs))
-
-                priorTotalBytes.addAndGet(copied)
-                perFileBytes.set(0)
-
-                session.add(srcFile.name)
-                batch.add(srcFile.name, isMediaStore, newDoc)
                 filesCopied++
+            }
+
+            // -------- End-of-batch retry pass: up to 3 more attempts per failed file --------
+            if (failedFiles.isNotEmpty()) {
+                Log.i(TAG, "[saf] end-of-batch retry: ${failedFiles.size} files")
+                val stillFailed = mutableListOf<SafFile>()
+                for (srcFile in failedFiles) {
+                    currentName.set(srcFile.name)
+                    perFileBytes.set(0)
+                    var recovered = false
+                    for (attempt in 2..4) {
+                        val bytes = attemptSafCopy(srcFile, "try$attempt")
+                        if (bytes >= 0) {
+                            recovered = true
+                            filesCopied++
+                            break
+                        }
+                        delay(300)
+                    }
+                    if (!recovered) stillFailed += srcFile
+                }
+                failedFiles.clear()
+                failedFiles += stillFailed
+                Log.i(TAG, "[saf] after retry: ${failedFiles.size} still failed")
             }
         } finally {
             session.close()
@@ -469,6 +573,7 @@ class CopyEngine(
         send(CopyState.Done(
             filesCopied = filesCopied,
             filesSkipped = toSkip.size,
+            filesFailed = failedFiles.size,
             totalBytes = totalBytes,
             elapsedMillis = elapsed,
         ))
@@ -565,11 +670,17 @@ class CopyEngine(
      * Stream-copy a SAF source file's bytes to [dstUri]. Uses [android.os.FileUtils.copy]
      * which dispatches to splice(2)/sendfile(2) when both descriptors are seekable
      * (typical for SAF-on-storage), falling back to a buffered read/write loop.
+     *
+     * [signal] is forwarded to FileUtils.copy so a stall-watchdog (or the user)
+     * can cancel mid-transfer. FileUtils throws [android.os.OperationCanceledException]
+     * on cancellation, which the caller treats as a per-file failure for the
+     * end-of-batch retry pass.
      */
     private fun copyOneViaSaf(
         resolver: ContentResolver,
         src: SafFile,
         dstUri: Uri,
+        signal: android.os.CancellationSignal,
         onProgress: (Long) -> Unit,
     ): Long {
         val srcPfd = resolver.openFileDescriptor(src.docUri, "r")
@@ -583,7 +694,7 @@ class CopyEngine(
                     android.os.FileUtils.copy(
                         sp.fileDescriptor,
                         dp.fileDescriptor,
-                        null, // CancellationSignal — coroutine cancellation handles it
+                        signal,
                         executor,
                         android.os.FileUtils.ProgressListener { progress -> onProgress(progress) },
                     )
@@ -827,19 +938,32 @@ class CopyEngine(
     }
 
     /**
-     * Create the destination URI for one file. Returns (uri, isMediaStore).
+     * Create the destination URI for one file, honouring the layout (flat vs
+     * structured) and the MediaStore fast-path where it applies. Returns
+     * (uri, isMediaStore).
      *
-     * If the MediaStore relative-path is non-null AND the MIME is image or video,
-     * we [ContentResolver.insert] into the relevant collection with IS_PENDING=1.
-     * Otherwise, fall back to SAF createDocument.
+     * In **flat** mode (`layout.preservesStructure == false`), the file lands
+     * directly under the destination root — same as the original behaviour.
+     *
+     * In **structured** mode, the file's source-relative parent path
+     * ([sourceRelPath]) is appended below the per-device subdir to produce
+     * `<dest>/<subdir>/<sourceRelPath>/<filename>`. For MediaStore-backed
+     * destinations we just extend RELATIVE_PATH and let MediaProvider create
+     * any missing directories. For SAF-backed destinations we walk the
+     * DocumentsContract tree creating each missing dir along the way (one
+     * round-trip per missing segment, but only on first copy — cached after).
      */
-    private fun createDestinationUri(
+    private fun createDestinationUriIn(
         resolver: ContentResolver,
+        destinationTreeUri: Uri,
         safDestDir: Uri,
         mediaStoreRelPath: String?,
+        sourceRelPath: String,
+        layout: CopyLayout,
         fileName: String,
         mime: String,
     ): Pair<Uri, Boolean> {
+        val nestedRel = nestedRelPath(layout, sourceRelPath)
         if (mediaStoreRelPath != null) {
             val collection = when {
                 mime.startsWith("image/") -> MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -847,20 +971,96 @@ class CopyEngine(
                 else -> null
             }
             if (collection != null) {
+                val effectiveRelPath = if (nestedRel.isEmpty()) mediaStoreRelPath
+                    else mediaStoreRelPath.trimEnd('/') + "/" + nestedRel + "/"
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, mediaStoreRelPath)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, effectiveRelPath)
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 val uri = resolver.insert(collection, values)
                 if (uri != null) return uri to true
-                Log.w(TAG, "MediaStore insert returned null for $fileName; falling back to SAF")
+                Log.w(TAG, "MediaStore insert returned null for $effectiveRelPath$fileName; falling back to SAF")
             }
         }
-        val uri = DocumentsContract.createDocument(resolver, safDestDir, mime, fileName)
+        val targetDir = if (nestedRel.isEmpty()) safDestDir
+            else findOrCreateSafSubdir(resolver, destinationTreeUri, safDestDir, nestedRel)
+        val uri = DocumentsContract.createDocument(resolver, targetDir, mime, fileName)
             ?: throw IOException("createDocument returned null")
         return uri to false
+    }
+
+    /**
+     * Combine the layout's subdir with the source-side relative parent path
+     * into a single `subdir/srcSubdir/.../` segment, with separators normalised
+     * and the leading "/" that PTP paths carry stripped. Returns "" in flat mode
+     * or when both segments are empty (e.g. files at source root in structured
+     * mode with a root-only subdir).
+     */
+    private fun nestedRelPath(layout: CopyLayout, sourceRelPath: String): String {
+        if (!layout.preservesStructure) return ""
+        val src = sourceRelPath.trim().trim('/').replace(Regex("/+"), "/")
+        val sub = layout.subdir!!.trim('/')
+        return if (src.isEmpty()) sub else "$sub/$src"
+    }
+
+    /**
+     * Walk from [parentDocUri] through each segment of [relPath], creating dirs
+     * as needed. Returns the document URI of the leaf directory. Caches lookups
+     * via a per-call doc-id map so repeated copies into the same source folder
+     * don't re-query.
+     */
+    private fun findOrCreateSafSubdir(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        parentDocUri: Uri,
+        relPath: String,
+    ): Uri {
+        var currentDocId = DocumentsContract.getDocumentId(parentDocUri)
+        for (segment in relPath.split('/').filter { it.isNotEmpty() }) {
+            currentDocId = findOrCreateSafChildDir(resolver, treeUri, currentDocId, segment)
+        }
+        return DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocId)
+    }
+
+    private fun findOrCreateSafChildDir(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        parentDocId: String,
+        name: String,
+    ): String {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        try {
+            resolver.query(
+                children,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                ),
+                null, null, null,
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                while (c.moveToNext()) {
+                    if (c.getString(nameCol) == name &&
+                        c.getString(mimeCol) == DocumentsContract.Document.MIME_TYPE_DIR
+                    ) {
+                        return c.getString(idCol)
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "findOrCreate: list children of $parentDocId failed: ${t.message}")
+        }
+        val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocId)
+        val newUri = DocumentsContract.createDocument(
+            resolver, parentDocUri,
+            DocumentsContract.Document.MIME_TYPE_DIR, name,
+        ) ?: throw IOException("createDocument(dir=$name) returned null under $parentDocId")
+        return DocumentsContract.getDocumentId(newUri)
     }
 
     private fun readMediaLong(
@@ -1065,7 +1265,162 @@ class CopyEngine(
     }
 
     /**
-     * Enumerate destination file names to suppress duplicate copies.
+     * Enumerate keys (basenames in flat mode, "relPath/basename" in structured
+     * mode) of every file currently in the destination layout, so the partition
+     * step can skip files that already exist. Dispatches by [CopyLayout].
+     *
+     * The hidden index file ([com.garag.nikoncopy.data.DestinationIndex])
+     * is filtered out of the result so it doesn't masquerade as a skip-able
+     * source file.
+     */
+    private fun readDestinationKeys(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        layout: CopyLayout,
+    ): Set<String> {
+        return if (layout.preservesStructure) {
+            readDestinationKeysNested(resolver, treeUri, layout.subdir!!)
+        } else {
+            readDestinationNames(resolver, treeUri).filterNot { it.startsWith(".") }.toSet()
+        }
+    }
+
+    /**
+     * Recursively walk the destination's per-device subdir and collect every
+     * file's `<relPath>/<basename>` key. Also unions with MediaStore rows whose
+     * RELATIVE_PATH starts with `<mediaStoreBase>/<subdir>/` (LIKE query) to
+     * cover IS_PENDING=1 files that exist as `.pending-*` on disk — same
+     * concern as the flat-mode walker had.
+     */
+    private fun readDestinationKeysNested(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        subdir: String,
+    ): Set<String> {
+        val keys = HashSet<String>()
+
+        // 1) SAF tree walk under <root>/<subdir>.
+        val rootId = try { DocumentsContract.getTreeDocumentId(treeUri) } catch (_: Throwable) { return emptySet() }
+        val subdirDocId = findChildDocId(resolver, treeUri, rootId, subdir, mustBeDir = true)
+        if (subdirDocId != null) {
+            val queue: ArrayDeque<Pair<String, String>> = ArrayDeque()
+            queue.addLast(subdirDocId to "")
+            while (queue.isNotEmpty()) {
+                val (docId, relPrefix) = queue.removeFirst()
+                val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                try {
+                    resolver.query(
+                        children,
+                        arrayOf(
+                            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                            DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        ),
+                        null, null, null,
+                    )?.use { c ->
+                        val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                        val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                        val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                        while (c.moveToNext()) {
+                            val n = c.getString(nameCol) ?: continue
+                            val isDir = c.getString(mimeCol) == DocumentsContract.Document.MIME_TYPE_DIR
+                            if (isDir) {
+                                val nextPrefix = if (relPrefix.isEmpty()) n else "$relPrefix/$n"
+                                queue.addLast(c.getString(idCol) to nextPrefix)
+                            } else {
+                                keys += if (relPrefix.isEmpty()) n else "$relPrefix/$n"
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "readDestinationKeysNested: walk $docId failed: ${t.message}")
+                }
+            }
+        }
+
+        // 2) MediaStore query — RELATIVE_PATH LIKE '<base>/<subdir>/%' to catch
+        //    IS_PENDING=1 files that the SAF walk would see as `.pending-*`.
+        val mediaBase = mediaStoreRelativePath(treeUri)
+        if (mediaBase != null) {
+            val basePrefix = mediaBase.trimEnd('/') + "/" + subdir.trim('/') + "/"
+            val collections = listOf(
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            )
+            val projection = arrayOf(
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.RELATIVE_PATH,
+            )
+            val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+            val args = arrayOf("$basePrefix%")
+            val queryBundle = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args)
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+            }
+            for (collection in collections) {
+                try {
+                    resolver.query(collection, projection, queryBundle, null)?.use { c ->
+                        val nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                        val rpCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+                        while (c.moveToNext()) {
+                            val name = c.getString(nameCol) ?: continue
+                            val rp = c.getString(rpCol) ?: continue
+                            val under = rp.removePrefix(basePrefix).trim('/')
+                            keys += if (under.isEmpty()) name else "$under/$name"
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "readDestinationKeysNested MediaStore LIKE failed: ${t.message}")
+                }
+            }
+        }
+
+        return keys
+    }
+
+    /**
+     * Look up the doc id of a single child by name. Returns null if no match
+     * (or if [mustBeDir] is true and the match isn't a directory). Used by the
+     * structure-mode existing-name walk to locate the per-device subdir.
+     */
+    private fun findChildDocId(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        parentDocId: String,
+        name: String,
+        mustBeDir: Boolean,
+    ): String? {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        return try {
+            resolver.query(
+                children,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                ),
+                null, null, null,
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                while (c.moveToNext()) {
+                    if (c.getString(nameCol) == name) {
+                        val isDir = c.getString(mimeCol) == DocumentsContract.Document.MIME_TYPE_DIR
+                        if (!mustBeDir || isDir) return@use c.getString(idCol)
+                    }
+                }
+                null
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "findChildDocId: list children of $parentDocId failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Enumerate destination file names to suppress duplicate copies (flat mode).
      *
      * CRITICAL: When a MediaStore row has IS_PENDING=1, MediaProvider
      * renames the underlying file on disk to `.pending-<timestamp>-<name>`.

@@ -63,12 +63,37 @@ object NikonDirect {
             return null
         }
         if (preferredDeviceKey != null) {
-            cameras.firstOrNull { deviceKey(it) == preferredDeviceKey }?.let { return it }
+            cameras.firstOrNull { keysReferToSameDevice(preferredDeviceKey, deviceKey(it)) }
+                ?.let { return it }
         }
         return cameras.firstOrNull { it.vendorId == NIKON_VID } ?: cameras.first()
     }
 
+    /**
+     * Stable identifier for a physical USB device.
+     *
+     * Two output formats:
+     *   - **v2 (strong identity)**: `v2:<vid>:<pid>:<serial>` — emitted when the
+     *     USB iSerial descriptor is readable. Distinct serials for two physical
+     *     bodies of the same model (e.g. two Z f) → distinct keys. Required for
+     *     [keysReferToSameDevice] to treat them as non-matching.
+     *   - **legacy fallback**: `<vid>:<pid>:<mfr>:<product>` — emitted when no
+     *     serial is available (typically before USB permission has been granted,
+     *     or for devices whose firmware omits iSerial). Treated as ambiguous —
+     *     [keysReferToSameDevice] will match a legacy key against a v2 key with
+     *     the same vid:pid prefix, allowing the old profile to "upgrade" silently
+     *     once the serial becomes readable.
+     *
+     * The `v2:` prefix is the marker that distinguishes the two formats; tokens
+     * are otherwise sanitised to lowercase alphanumerics / `_.-`.
+     */
     fun deviceKey(device: UsbDevice): String {
+        val serial = runCatching { device.serialNumber }.getOrNull()
+            ?.sanitizeKeyPart()
+            ?.takeIf { it.isNotBlank() }
+        val base = "%04x:%04x".format(device.vendorId, device.productId)
+        if (serial != null) return "v2:$base:$serial"
+
         val manufacturer = runCatching { device.manufacturerName }.getOrNull()
             ?.sanitizeKeyPart()
             .orEmpty()
@@ -76,7 +101,7 @@ object NikonDirect {
             ?.sanitizeKeyPart()
             .orEmpty()
         return buildString {
-            append("%04x:%04x".format(device.vendorId, device.productId))
+            append(base)
             if (manufacturer.isNotBlank() || product.isNotBlank()) {
                 append(":")
                 append(manufacturer)
@@ -85,6 +110,39 @@ object NikonDirect {
             }
         }
     }
+
+    /**
+     * True if [saved] and [detected] refer to the same physical device.
+     *
+     * Exact equality is always a match. If both keys are in v2 form (serial-bearing),
+     * differing serials mean different bodies — no match. Otherwise (one or both are
+     * legacy), fall back to matching by the vid:pid prefix so old configs can be
+     * upgraded silently the first time a body is reconnected after granting USB
+     * permission.
+     */
+    fun keysReferToSameDevice(saved: String, detected: String): Boolean {
+        if (saved == detected) return true
+        val savedV2 = saved.startsWith("v2:")
+        val detectedV2 = detected.startsWith("v2:")
+        if (savedV2 && detectedV2) return false
+        val savedPrefix = vidPidPrefix(saved) ?: return false
+        val detectedPrefix = vidPidPrefix(detected) ?: return false
+        return savedPrefix == detectedPrefix
+    }
+
+    /** Extract `vid:pid` from either format, or null if the key isn't shaped like a USB key. */
+    private fun vidPidPrefix(key: String): String? {
+        val core = if (key.startsWith("v2:")) key.removePrefix("v2:") else key
+        val parts = core.split(":")
+        if (parts.size < 2) return null
+        // Ensure they look like 4-hex tokens so we don't accidentally match MSC keys
+        // (msc:<uuid>) — those have only 2 colon-separated parts and the first isn't hex.
+        if (!parts[0].matches(HEX4)) return null
+        if (!parts[1].matches(HEX4)) return null
+        return "${parts[0]}:${parts[1]}"
+    }
+
+    private val HEX4 = Regex("[0-9a-f]{1,4}")
 
     fun deviceDisplayName(device: UsbDevice): String {
         val manufacturer = runCatching { device.manufacturerName }.getOrNull()

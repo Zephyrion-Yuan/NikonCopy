@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
+        android:name=".NikonCopyApp"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
@@ -40,6 +41,23 @@
             android:name=".copy.CopyService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!--
+            FileProvider used solely by the "导出运行日志" action in Settings:
+            hands a one-shot read grant on the freshly-written log file to
+            whichever app the user picks from the share sheet (微信 / Telegram /
+            邮件 / 网盘 / …). Authority is namespaced under the applicationId
+            so it never collides with any other app's FileProvider.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 </manifest>

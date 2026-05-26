@@ -59,88 +59,91 @@ private val SKIP_DIRS = setOf(
 data class DirHit(
     /** Path relative to the scan root, "/" separated. Empty string for root itself. */
     val path: String,
-    val fileCount: Int,
-    /** Extension (lowercase, no dot) → file count. */
-    val extensionCounts: Map<String, Int>,
+    /** Distinct extensions we sampled in this directory. Counts intentionally drop:
+     *  with the two-stage probe we record at most one example per (dir, ext) pair to
+     *  keep coverage of the directory list complete even on volumes with 60+ subdirs. */
+    val extensions: Set<String>,
+    /** Max `COLUMN_LAST_MODIFIED` we saw across all media files inside this dir.
+     *  Used by the settings UI to sort the source-subdir checkboxes newest-first
+     *  (so the user's most recent shoot lands at the top of the list). 0 when
+     *  the SAF provider didn't supply mtimes (rare; some camera providers omit
+     *  it but standard SD/USB MSC always has it). */
+    val lastModifiedAt: Long = 0L,
 )
 
 data class MediaProbeResult(
     val directories: List<DirHit>,
-    val totalFilesScanned: Int,
     val totalDirsScanned: Int,
     val elapsedMs: Long,
     /** True iff the scan returned via the fast convention probe. */
     val usedConventionProbe: Boolean,
-    /** True iff scan stopped early due to a file/dir/time limit. */
+    /** True iff scan stopped early due to a dir or time limit. */
     val bailedOnLimit: Boolean,
 ) {
-    val totalMediaFiles: Int get() = directories.sumOf { it.fileCount }
-    val allExtensions: Set<String> get() = directories.flatMap { it.extensionCounts.keys }.toSet()
+    val allExtensions: Set<String> get() = directories.flatMap { it.extensions }.toSet()
     val allDirectories: Set<String> get() = directories.map { it.path }.toSet()
 }
 
 /**
  * Discover importable media inside a SAF tree (e.g. a mounted SD/USB volume).
  *
- * Strategy:
- *   1. Enumerate the tree root and look for conventional camera/user directory
- *      names (`DCIM`, `PRIVATE`, `Pictures`, etc.). If any are found, recurse
- *      into those only — this is the *fast path* for cameras and SD cards,
- *      finishing in seconds.
- *   2. If nothing matches the convention (the device has an ad-hoc layout),
- *      fall back to a bounded breadth-first walk over the entire tree, capped
- *      at [maxFiles] media files, [maxDirs] directories, or [maxMs] wallclock.
- *      The first limit hit short-circuits the scan; [MediaProbeResult.bailedOnLimit]
- *      tells the caller whether the result is partial.
+ * Two-stage strategy designed to be **complete on the directory list** even when
+ * a volume has dozens of top-level subdirectories with thousands of files each:
+ *
+ *   1. Walk the tree depth-first, but for each (directory × extension) pair record
+ *      AT MOST ONE example. The cursor still iterates a dir's children, but the
+ *      `mediaByParent` map stops growing after we've seen each ext once per dir.
+ *      This decouples the scan's cost from the file count — a 10k-file dir costs
+ *      the same as a 10-file dir for our purposes.
+ *   2. Enumerate conventional camera/user directory names at the root for a fast
+ *      path; if no convention match, fall back to a bounded BFS over the whole
+ *      tree (dir + wallclock limits only — no per-file limit, since files don't
+ *      meaningfully accumulate state under the dedup rule).
  *
  * Directories named in [SKIP_DIRS] or starting with `.` are skipped at every
- * level so we never blow time on Android system folders, recycle bins, or
- * macOS metadata.
- *
- * Aggregates results into one [DirHit] per parent directory of media.
+ * level so we never waste time on Android system folders, recycle bins, or
+ * macOS metadata. Hidden files at the destination root (e.g. `.nikoncopy_index.json`)
+ * are also ignored.
  */
 object MediaProbe {
 
-    private const val DEFAULT_MAX_FILES = 8000
-    private const val DEFAULT_MAX_DIRS = 200
-    private const val DEFAULT_MAX_MS = 15_000L
+    /** Generous limits: dir/time only. With per-(dir,ext) dedup the file count is bounded
+     *  by `dirs × known-exts`, so we don't need a separate file cap. */
+    private const val DEFAULT_MAX_DIRS = 2000
+    private const val DEFAULT_MAX_MS = 30_000L
 
     suspend fun probeSaf(
         resolver: ContentResolver,
         treeUri: Uri,
-        maxFiles: Int = DEFAULT_MAX_FILES,
         maxDirs: Int = DEFAULT_MAX_DIRS,
         maxMs: Long = DEFAULT_MAX_MS,
     ): MediaProbeResult {
         val started = System.currentTimeMillis()
         val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-        val limits = Limits(maxFiles, maxDirs, started + maxMs)
+        val limits = Limits(maxDirs, started + maxMs)
 
         val rootChildren = listChildren(resolver, treeUri, rootDocId)
         val rootMatchedDirs = rootChildren.filter { entry ->
             entry.isDir && entry.name.notSkippable() && entry.name.matchesConvention()
         }
 
-        val mediaByParent = mutableMapOf<String, MutableMap<String, Int>>()
-        var filesScanned = 0
+        val mediaByParent = mutableMapOf<String, MutableSet<String>>()
+        val mtimeByParent = mutableMapOf<String, Long>()
         var dirsScanned = 1
 
         if (rootMatchedDirs.isNotEmpty()) {
             for (start in rootMatchedDirs) {
                 if (limits.exhausted()) break
-                val (f, d) = walkSubtree(
-                    resolver, treeUri, start.documentId, start.name, mediaByParent, limits,
+                dirsScanned += walkSubtree(
+                    resolver, treeUri, start.documentId, start.name, mediaByParent, mtimeByParent, limits,
                 )
-                filesScanned += f
-                dirsScanned += d
             }
             // Also pick up any stray media sitting at the root (e.g. a flat USB stick).
             for (entry in rootChildren) {
-                if (limits.exhausted()) break
                 if (entry.isDir) continue
-                recordMedia(entry.name, parentPath = "", mediaByParent)?.let { filesScanned++ }
+                recordMedia(entry.name, entry.lastModified, parentPath = "", mediaByParent, mtimeByParent)
             }
-            return assemble(mediaByParent, filesScanned, dirsScanned, started, usedConvention = true, bailed = limits.bailed)
+            return assemble(mediaByParent, mtimeByParent, dirsScanned, started, usedConvention = true, bailed = limits.bailed)
         }
 
         // No convention match → bounded BFS from root.
@@ -148,34 +151,31 @@ object MediaProbe {
             if (limits.exhausted()) break
             if (entry.isDir) {
                 if (!entry.name.notSkippable()) continue
-                val (f, d) = walkSubtree(
-                    resolver, treeUri, entry.documentId, entry.name, mediaByParent, limits,
+                dirsScanned += walkSubtree(
+                    resolver, treeUri, entry.documentId, entry.name, mediaByParent, mtimeByParent, limits,
                 )
-                filesScanned += f
-                dirsScanned += d
             } else {
-                recordMedia(entry.name, parentPath = "", mediaByParent)?.let { filesScanned++ }
+                recordMedia(entry.name, entry.lastModified, parentPath = "", mediaByParent, mtimeByParent)
             }
         }
-        return assemble(mediaByParent, filesScanned, dirsScanned, started, usedConvention = false, bailed = limits.bailed)
+        return assemble(mediaByParent, mtimeByParent, dirsScanned, started, usedConvention = false, bailed = limits.bailed)
     }
 
     private fun assemble(
-        mediaByParent: Map<String, Map<String, Int>>,
-        filesScanned: Int,
+        mediaByParent: Map<String, Set<String>>,
+        mtimeByParent: Map<String, Long>,
         dirsScanned: Int,
         startedAt: Long,
         usedConvention: Boolean,
         bailed: Boolean,
     ): MediaProbeResult {
         val hits = mediaByParent
-            .map { (path, exts) -> DirHit(path, exts.values.sum(), exts) }
-            .sortedByDescending { it.fileCount }
+            .map { (path, exts) -> DirHit(path, exts.toSet(), mtimeByParent[path] ?: 0L) }
+            .sortedByDescending { it.lastModifiedAt }
         val elapsed = System.currentTimeMillis() - startedAt
-        Log.i(TAG, "probe done: dirs=$dirsScanned files=$filesScanned hits=${hits.size} convention=$usedConvention bailed=$bailed elapsed=${elapsed}ms")
+        Log.i(TAG, "probe done: dirs=$dirsScanned hits=${hits.size} exts=${hits.flatMap { it.extensions }.toSet().size} convention=$usedConvention bailed=$bailed elapsed=${elapsed}ms")
         return MediaProbeResult(
             directories = hits,
-            totalFilesScanned = filesScanned,
             totalDirsScanned = dirsScanned,
             elapsedMs = elapsed,
             usedConventionProbe = usedConvention,
@@ -184,7 +184,7 @@ object MediaProbe {
     }
 
     /** Mutable budget; first limit reached aborts the scan. */
-    private class Limits(val maxFiles: Int, val maxDirs: Int, val deadlineMs: Long) {
+    private class Limits(val maxDirs: Int, val deadlineMs: Long) {
         var bailed: Boolean = false
         fun exhausted(): Boolean {
             if (System.currentTimeMillis() > deadlineMs) { bailed = true; return true }
@@ -192,15 +192,16 @@ object MediaProbe {
         }
     }
 
+    /** Returns the number of additional directories scanned. */
     private fun walkSubtree(
         resolver: ContentResolver,
         treeUri: Uri,
         startDocId: String,
         startPath: String,
-        mediaByParent: MutableMap<String, MutableMap<String, Int>>,
+        mediaByParent: MutableMap<String, MutableSet<String>>,
+        mtimeByParent: MutableMap<String, Long>,
         limits: Limits,
-    ): Pair<Int, Int> {
-        var filesScanned = 0
+    ): Int {
         var dirsScanned = 0
         val queue: ArrayDeque<Pair<String, String>> = ArrayDeque()
         queue.addLast(startDocId to startPath)
@@ -208,44 +209,62 @@ object MediaProbe {
             if (limits.exhausted()) break
             val (docId, path) = queue.removeFirst()
             dirsScanned++
+            // Track which exts we've already recorded for this dir so we can stop
+            // scanning its children once everything's been sampled. This is the key
+            // dedup optimisation: a 10k-file folder costs the same as a 10-file one.
+            //
+            // We still let mtime updates pass through every file (no dedup) so the
+            // dir's recorded mtime is the max across ALL its children, not just
+            // the first-of-each-ext sample. That gives the settings UI an
+            // accurate "newest shoot" timestamp for sorting.
+            val recordedHere = mediaByParent[path] ?: mutableSetOf()
             for (entry in listChildren(resolver, treeUri, docId)) {
                 if (limits.exhausted()) break
                 if (entry.isDir) {
                     if (!entry.name.notSkippable()) continue
                     queue.addLast(entry.documentId to "$path/${entry.name}")
                 } else {
-                    val added = recordMedia(entry.name, parentPath = path, mediaByParent) != null
-                    if (added) {
-                        filesScanned++
-                        if (filesScanned >= limits.maxFiles) {
-                            limits.bailed = true
-                            break
-                        }
+                    val ext = entry.name.substringAfterLast('.', "").lowercase()
+                    if (ext.isBlank() || ext !in KNOWN_MEDIA_EXTS) continue
+                    // mtime tracking is independent of ext dedup — always update.
+                    if (entry.lastModified > (mtimeByParent[path] ?: 0L)) {
+                        mtimeByParent[path] = entry.lastModified
                     }
+                    if (ext in recordedHere) continue  // already sampled this ext in this dir
+                    mediaByParent.getOrPut(path) { mutableSetOf() }.add(ext)
+                    recordedHere.add(ext)
                 }
             }
-            if (dirsScanned >= limits.maxDirs) {
+            if (dirsScanned + 1 > limits.maxDirs) {
                 limits.bailed = true
                 break
             }
         }
-        return filesScanned to dirsScanned
+        return dirsScanned
     }
 
-    /** If [fileName]'s extension is in [KNOWN_MEDIA_EXTS], record it and return the ext. */
+    /** If [fileName]'s extension is in [KNOWN_MEDIA_EXTS], record it. Dedup'd by (path, ext). */
     private fun recordMedia(
         fileName: String,
+        lastModified: Long,
         parentPath: String,
-        mediaByParent: MutableMap<String, MutableMap<String, Int>>,
-    ): String? {
+        mediaByParent: MutableMap<String, MutableSet<String>>,
+        mtimeByParent: MutableMap<String, Long>,
+    ) {
         val ext = fileName.substringAfterLast('.', "").lowercase()
-        if (ext.isBlank() || ext !in KNOWN_MEDIA_EXTS) return null
-        mediaByParent.getOrPut(parentPath) { mutableMapOf() }
-            .merge(ext, 1, Int::plus)
-        return ext
+        if (ext.isBlank() || ext !in KNOWN_MEDIA_EXTS) return
+        mediaByParent.getOrPut(parentPath) { mutableSetOf() }.add(ext)
+        if (lastModified > (mtimeByParent[parentPath] ?: 0L)) {
+            mtimeByParent[parentPath] = lastModified
+        }
     }
 
-    private data class Child(val documentId: String, val name: String, val isDir: Boolean)
+    private data class Child(
+        val documentId: String,
+        val name: String,
+        val isDir: Boolean,
+        val lastModified: Long,
+    )
 
     private fun listChildren(resolver: ContentResolver, treeUri: Uri, parentDocId: String): List<Child> {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
@@ -253,6 +272,7 @@ object MediaProbe {
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
         val out = ArrayList<Child>()
         try {
@@ -260,6 +280,7 @@ object MediaProbe {
                 val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                 val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val mtimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
                 while (c.moveToNext()) {
                     val mime = c.getString(mimeCol)
                     val name = c.getString(nameCol) ?: continue
@@ -267,6 +288,7 @@ object MediaProbe {
                         documentId = c.getString(idCol),
                         name = name,
                         isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR,
+                        lastModified = if (mtimeCol >= 0 && !c.isNull(mtimeCol)) c.getLong(mtimeCol) else 0L,
                     )
                 }
             }

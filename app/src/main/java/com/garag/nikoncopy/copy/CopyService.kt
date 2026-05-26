@@ -15,6 +15,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.garag.nikoncopy.MainActivity
 import com.garag.nikoncopy.R
+import com.garag.nikoncopy.data.DestinationIndex
 import com.garag.nikoncopy.data.ManifestStore
 import com.garag.nikoncopy.data.SettingsRepository
 import com.garag.nikoncopy.mtp.NikonDirect
@@ -147,13 +148,15 @@ class CopyService : Service() {
                         extensions = it.selectedExtensions,
                     )
                 } ?: CopyFilter()
+                val layout = resolveLayout(profile, destination)
                 android.util.Log.i(
                     "CopyService",
                     "using DIRECT PTP path device=${opened.deviceKey} profile=${profile?.id ?: "(none)"} " +
-                        "dirs=${filter.directories.size} exts=${filter.extensions.size}",
+                        "dirs=${filter.directories.size} exts=${filter.extensions.size} " +
+                        "layout=${if (layout.preservesStructure) "structured(${layout.subdir})" else "flat"}",
                 )
                 updateNotification(0f, "正在扫描 (直连)…", null)
-                val flow = engine.copyFlowDirect(opened.client, destination, mode, filter)
+                val flow = engine.copyFlowDirect(opened.client, destination, mode, filter, layout)
                 flow.collect { s ->
                     _state.value = s
                     when (s) {
@@ -183,8 +186,15 @@ class CopyService : Service() {
                             if (profile != null) {
                                 settings.recordCopyCompleted(profile.id, System.currentTimeMillis(), s.filesCopied.toLong())
                             }
-                            val sub = if (s.filesSkipped > 0) "跳过 ${s.filesSkipped} 个同名文件" else null
-                            updateNotification(1f, "完成 · 拷贝 ${s.filesCopied} 个文件", sub)
+                            val parts = mutableListOf<String>()
+                            if (s.filesSkipped > 0) parts += "跳过 ${s.filesSkipped} 个同名文件"
+                            if (s.filesFailed > 0) parts += "失败 ${s.filesFailed} 个（再次点击拷贝可重试）"
+                            val sub = parts.joinToString(" · ").takeIf { it.isNotBlank() }
+                            val title = if (s.filesFailed > 0)
+                                "完成（有失败）· 拷贝 ${s.filesCopied} 个文件"
+                            else
+                                "完成 · 拷贝 ${s.filesCopied} 个文件"
+                            updateNotification(1f, title, sub)
                         }
                         is CopyState.Failed -> {
                             updateNotification(0f, "失败", s.message)
@@ -262,15 +272,17 @@ class CopyService : Service() {
             directories = profile.selectedDirectories,
             extensions = profile.selectedExtensions,
         )
+        val layout = resolveLayout(profile, destination)
         android.util.Log.i(
             "CopyService",
             "using SAF path ($label) profile=${profile.id} src=$sourceTree " +
-                "dirs=${filter.directories.size} exts=${filter.extensions.size}",
+                "dirs=${filter.directories.size} exts=${filter.extensions.size} " +
+                "layout=${if (layout.preservesStructure) "structured(${layout.subdir})" else "flat"}",
         )
         updateNotification(0f, "正在扫描 ($label)…", null)
 
         try {
-            engine.copyFlowSaf(sourceTree, destination, mode, filter).collect { s ->
+            engine.copyFlowSaf(sourceTree, destination, mode, filter, layout).collect { s ->
                 _state.value = s
                 when (s) {
                     is CopyState.Scanning -> updateNotification(0f, "扫描中：发现 ${s.foundFiles} 个文件", null)
@@ -338,6 +350,37 @@ class CopyService : Service() {
             } finally {
                 stopForegroundCompat()
             }
+        }
+    }
+
+    /**
+     * Resolve the on-disk layout this copy session should produce. In flat mode
+     * (default, [DeviceProfile.copyDirectoryStructure] == false) returns a
+     * no-op [CopyLayout]. In structure mode, allocates (on first copy) or looks
+     * up the per-device subdir via [DestinationIndex] living at the destination
+     * root — so deleting a profile + recreating it naturally resumes into the
+     * same subdir and the existing-name skip logic carries the incremental
+     * state across.
+     *
+     * Blocking: this is called from the copy coroutine which is already on
+     * Dispatchers.IO, so a synchronous-style suspend call is fine.
+     */
+    private suspend fun resolveLayout(
+        profile: com.garag.nikoncopy.data.DeviceProfile?,
+        destination: Uri,
+    ): CopyLayout {
+        if (profile == null || !profile.copyDirectoryStructure) return CopyLayout()
+        if (destination == Uri.EMPTY) return CopyLayout()
+        return try {
+            val index = DestinationIndex(applicationContext.contentResolver, destination)
+            val binding = index.resolveOrAllocate(
+                deviceKey = profile.deviceKey,
+                preferredName = profile.deviceName,
+            )
+            CopyLayout(subdir = binding.subdir)
+        } catch (t: Throwable) {
+            android.util.Log.w("CopyService", "resolveLayout failed; falling back to flat: ${t.message}")
+            CopyLayout()
         }
     }
 

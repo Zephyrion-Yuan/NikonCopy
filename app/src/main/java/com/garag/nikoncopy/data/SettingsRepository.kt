@@ -1,6 +1,7 @@
 package com.garag.nikoncopy.data
 
 import android.content.Context
+import android.util.Log
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
@@ -10,6 +11,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+
+private const val TAG = "SettingsRepository"
 
 private val Context.dataStore by preferencesDataStore(name = "nikoncopy_settings")
 
@@ -72,8 +75,23 @@ class SettingsRepository(private val context: Context) {
             else profiles.firstOrNull { it.id == id } ?: profiles.firstOrNull()
         }
 
-    /** Destination URI, derived from active profile so existing UI keeps working. */
-    val destinationUri: Flow<String?> = activeProfile.map { it?.destinationUri }
+    /**
+     * Global "默认保存目录" — the value behind the top-level SettingRow in
+     * Settings, used as fallback whenever a [DeviceProfile.destinationUri]
+     * is null. Backed by [Keys.LEGACY_DESTINATION_URI] (the key kept its
+     * legacy name from the pre-multi-device era; now does double-duty as
+     * the writable backing store for the global default).
+     *
+     * IMPORTANT — this is intentionally NOT derived from the active profile.
+     * The earlier `activeProfile.map { it?.destinationUri }` implementation
+     * had a silent failure mode: with no profile yet, [setDestinationUri]
+     * wrote to LEGACY but the Flow returned null forever, so the SettingRow
+     * subtitle stayed at "未设置" after the user had clearly picked a folder.
+     * That looked exactly like the SAF picker had auto-dismissed.
+     */
+    val destinationUri: Flow<String?> = context.dataStore.data.map { prefs ->
+        prefs[Keys.LEGACY_DESTINATION_URI]?.takeIf(String::isNotBlank)
+    }
 
     /** Cache record, derived from active profile. */
     val cacheRecord: Flow<CacheRecord> = activeProfile.map { CacheRecord.of(it) }
@@ -102,8 +120,15 @@ class SettingsRepository(private val context: Context) {
     suspend fun upsertDeviceProfile(profile: DeviceProfile) {
         context.dataStore.edit { prefs ->
             val current = CameraProfileCodec.decode(prefs[Keys.DEVICE_PROFILES])
+            // Dedup by:
+            //   - same id (explicit update path), OR
+            //   - same physical device per [DeviceProfile.matches] — covers the
+            //     legacy→v2 upgrade case where a saved profile's deviceKey
+            //     differs textually from the new one but refers to the same
+            //     hardware. Without this filter the old legacy entry would
+            //     linger as a phantom alongside the upgraded one.
             val next = current
-                .filterNot { it.id == profile.id || it.deviceKey == profile.deviceKey }
+                .filterNot { it.id == profile.id || it.matches(profile.deviceKey) }
                 .plus(profile)
                 .sortedBy { it.deviceName.lowercase() }
             prefs[Keys.DEVICE_PROFILES] = CameraProfileCodec.encode(next)
@@ -141,16 +166,20 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    /** Set the destination on the currently active profile. */
+    /**
+     * Set the **global default** destination — the value the top-level
+     * "默认保存目录" row in Settings shows. Per-profile destinations live
+     * on [DeviceProfile.destinationUri] and are written via
+     * [updateCameraProfile]; this method intentionally does not touch them.
+     *
+     * CopyService picks the actual destination at copy time as
+     * `profile.destinationUri ?: <this value>`, so writing here gives every
+     * profile a working fallback without overwriting any per-profile
+     * override the user may have set.
+     */
     suspend fun setDestinationUri(uri: String) {
-        val active = activeProfileSnapshot()
-        if (active != null) {
-            updateDeviceProfile(active.id) { it.copy(destinationUri = uri, updatedAt = System.currentTimeMillis()) }
-        } else {
-            // No profile yet — stash on the legacy key so migration picks it up if/when
-            // a profile is added.
-            context.dataStore.edit { it[Keys.LEGACY_DESTINATION_URI] = uri }
-        }
+        Log.i(TAG, "setDestinationUri: writing global LEGACY_DESTINATION_URI = $uri")
+        context.dataStore.edit { it[Keys.LEGACY_DESTINATION_URI] = uri }
     }
 
     suspend fun recordCopyStarted(profileId: String, epochMillis: Long) {
